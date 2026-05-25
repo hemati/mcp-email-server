@@ -435,6 +435,41 @@ Test body content
         result = email_client._parse_email_data(raw_email, email_id="1")
         assert result["message_id"] is None
 
+    def test_parse_email_extracts_in_reply_to_and_references(self, email_client):
+        """In-Reply-To and References must be exposed for reply-threading clients.
+
+        Scher's stage-3a triage matches incoming replies against the
+        outbound Message-ID via In-Reply-To. Dropping these from the
+        parsed payload silently breaks that path — guard against it.
+        """
+        raw_email = b"""Message-ID: <reply123@example.com>
+In-Reply-To: <original@example.com>
+References: <root@example.com> <original@example.com>
+From: sender@example.com
+To: recipient@example.com
+Subject: Re: Test
+Date: Mon, 1 Jan 2024 12:00:00 +0000
+
+Reply body
+"""
+        result = email_client._parse_email_data(raw_email, email_id="1")
+        assert result["in_reply_to"] == "<original@example.com>"
+        assert result["references"] == "<root@example.com> <original@example.com>"
+
+    def test_parse_email_handles_missing_reply_headers(self, email_client):
+        """A non-reply message must default both fields to None, not crash."""
+        raw_email = b"""Message-ID: <fresh@example.com>
+From: sender@example.com
+To: recipient@example.com
+Subject: New thread
+Date: Mon, 1 Jan 2024 12:00:00 +0000
+
+Body
+"""
+        result = email_client._parse_email_data(raw_email, email_id="1")
+        assert result["in_reply_to"] is None
+        assert result["references"] is None
+
 
 class TestSendEmailReplyHeaders:
     @pytest.mark.asyncio
@@ -613,6 +648,35 @@ Date: Mon, 1 Jan 2024 12:00:00 +0000
         assert result["subject"] == "Minimal Email"
         assert result["from"] == ""
         assert result["to"] == []
+
+    def test_parse_headers_extracts_reply_headers(self, email_client):
+        """Metadata fast path must surface In-Reply-To and References.
+
+        list_emails_metadata uses _parse_headers (BODY.PEEK[HEADER]) rather
+        than the full-body path, so the fast path must thread these fields
+        through or reply-threading silently breaks on paged lookups.
+        """
+        raw_headers = b"""Message-ID: <reply@example.com>
+In-Reply-To: <parent@example.com>
+References: <root@example.com> <parent@example.com>
+From: sender@example.com
+To: recipient@example.com
+Subject: Re: Topic
+Date: Mon, 1 Jan 2024 12:00:00 +0000
+
+"""
+        result = email_client._parse_headers("789", raw_headers)
+        assert result["in_reply_to"] == "<parent@example.com>"
+        assert result["references"] == "<root@example.com> <parent@example.com>"
+
+    def test_parse_headers_missing_reply_headers_default_to_none(self, email_client):
+        """Original threads (no parent) must give None — not raise, not empty string."""
+        raw_headers = b"""Subject: Standalone
+
+"""
+        result = email_client._parse_headers("999", raw_headers)
+        assert result["in_reply_to"] is None
+        assert result["references"] is None
 
 
 class TestBatchFetchDates:

@@ -115,6 +115,27 @@ für Test-/Staging-Konfigurationen. Trotzdem klein und sauber, leicht herauspatc
 
 Briefing-Punkt 1 (`move_emails`) — **gestrichen**, upstream bereits umgesetzt.
 
+### 9. `In-Reply-To` / `References` in `EmailMetadata`
+
+Nachgereicht in Commit `49225ea` — **NEU**, Patch in bestehenden Modellen + Parsern.
+
+Notwendig, weil die Triage Replies via `In-Reply-To` gegen die outbound
+`Message-ID` matcht. Ohne diese Felder in der MCP-Response no-oped der
+Threading-Pfad und fiel auf Subject+From-Matching zurück — was beim
+Sink-Adresse-Setup (REDIRECT_TO mit Plus-Alias als Absender) bricht.
+
+- `EmailMetadata` / `EmailBodyResponse` bekommen zwei optionale Felder
+  `in_reply_to: str | None` und `references: str | None`.
+- Beide Parse-Pfade in `classic.py` (`_parse_email_data` für Volltext,
+  `_parse_headers` für die Metadata-Fastpath) lesen die Header und
+  reichen sie durch.
+- `ClassicEmailHandler.get_emails_content` füllt die neuen Felder im
+  Response-Konstruktor.
+
+Default `None` → alte Aufrufer unverändert.
+
+**Upstream-PR-Kandidat:** ja, klar generisch nützlich.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
@@ -122,12 +143,15 @@ Stand nach Implementierung der Patches (wird laufend aktualisiert):
 | Datei                                 | Änderung                                                                                                                                                                                   | Grund             |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- |
 | `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` erweitert                                                                                      | Handler-Interface |
-| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden | Implementation    |
+| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
+| `mcp_email_server/emails/models.py`   | `EmailMetadata` (und damit transitiv `EmailBodyResponse`) bekommen optionale Felder `in_reply_to`, `references`; `from_email`-Classmethod propagiert sie                                  | Data shape        |
 | `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                                                  | Tool-Surface      |
 | `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`-Tool-Wrappern + `register_scher_tools()`-Funktion                                                                   | Scher Extensions  |
 | `tests/test_scher_tools.py`           | **neue Datei** mit Mock-Tests für alle neuen Tools                                                                                                                                         | Testabdeckung     |
 | `tests/test_send_email_extensions.py` | **neue Datei** mit Tests für `message_id` und `REDIRECT_TO`                                                                                                                                | Regression-Schutz |
-| `pyproject.toml`                      | `name` → `mcp-email-server-scher`, Entry-Point angepasst                                                                                                                                   | Distribution      |
+| `tests/test_email_client.py`          | Tests für `In-Reply-To`/`References`-Parsing in beiden Parse-Pfaden (`_parse_email_data`, `_parse_headers`)                                                                              | Regression-Schutz |
+| `tests/test_models.py`                | Tests für `EmailMetadata.from_email` mit/ohne Reply-Header                                                                                                                              | Regression-Schutz |
+| `pyproject.toml`                      | `name` → `mcp-email-server-scher`, Entry-Point angepasst, hatchling wheel-package explizit                                                                                                | Distribution      |
 | `README.md`                           | Neue Sektion "Scher Extensions"                                                                                                                                                            | Doku              |
 
 ## Upstream-Sync-Strategie
@@ -145,7 +169,8 @@ Bei Gelegenheit als generische Features an `ai-zerolab/mcp-email-server` zurück
 1. `mark_seen` / `mark_unseen` (klar generisch)
 2. `ensure_folder` (klar generisch)
 3. `send_email` mit `message_id` Param (klar generisch)
-4. `diag`-Tool (evtl., wenn Format-Convention diskutiert)
+4. `In-Reply-To` / `References` in `EmailMetadata` (klar generisch — jeder MCP-IMAP-Client profitiert)
+5. `diag`-Tool (evtl., wenn Format-Convention diskutiert)
 
 Bewusst NICHT als PR (Scher-spezifisch):
 

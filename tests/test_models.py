@@ -75,6 +75,39 @@ class TestEmailMetadata:
         email_data = EmailMetadata.from_email(email_dict)
         assert email_data.message_id is None
 
+    def test_from_email_with_reply_headers(self):
+        """from_email propagates In-Reply-To and References when present."""
+        now = datetime.now(timezone.utc)
+        email_dict = {
+            "email_id": "456",
+            "message_id": "<reply@example.com>",
+            "in_reply_to": "<parent@example.com>",
+            "references": "<root@example.com> <parent@example.com>",
+            "subject": "Re: Topic",
+            "from": "sender@example.com",
+            "to": ["recipient@example.com"],
+            "date": now,
+            "attachments": [],
+        }
+        email_data = EmailMetadata.from_email(email_dict)
+        assert email_data.in_reply_to == "<parent@example.com>"
+        assert email_data.references == "<root@example.com> <parent@example.com>"
+
+    def test_from_email_without_reply_headers(self):
+        """Old-shape payloads without in_reply_to/references stay valid."""
+        now = datetime.now(timezone.utc)
+        email_dict = {
+            "email_id": "789",
+            "subject": "Standalone",
+            "from": "sender@example.com",
+            "to": ["recipient@example.com"],
+            "date": now,
+            "attachments": [],
+        }
+        email_data = EmailMetadata.from_email(email_dict)
+        assert email_data.in_reply_to is None
+        assert email_data.references is None
+
 
 class TestEmailMetadataPageResponse:
     def test_init(self):
