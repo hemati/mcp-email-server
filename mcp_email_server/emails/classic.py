@@ -247,6 +247,11 @@ class EmailClient:
 
         # Extract Message-ID for reply threading
         message_id = email_message.get("Message-ID")
+        # Expose In-Reply-To and References so clients can match incoming
+        # replies back to the messages they answer (essential for the
+        # Scher routing layer's stage-3a triage path).
+        in_reply_to = email_message.get("In-Reply-To")
+        references = email_message.get("References")
 
         # Extract recipients and parse date
         to_addresses = self._parse_recipients(email_message)
@@ -326,6 +331,8 @@ class EmailClient:
         return {
             "email_id": email_id or "",
             "message_id": message_id,
+            "in_reply_to": in_reply_to,
+            "references": references,
             "subject": subject,
             "from": sender,
             "to": to_addresses,
@@ -404,6 +411,8 @@ class EmailClient:
             date_str = email_message.get("Date", "")
             # Expose Message-ID for reply threading and de-duplication on the client.
             message_id = email_message.get("Message-ID")
+            in_reply_to = email_message.get("In-Reply-To")
+            references = email_message.get("References")
 
             to_addresses = self._parse_recipients(email_message)
             date = self._parse_date(date_str)
@@ -411,6 +420,8 @@ class EmailClient:
             return {
                 "email_id": email_id,
                 "message_id": message_id,
+                "in_reply_to": in_reply_to,
+                "references": references,
                 "subject": subject,
                 "from": sender,
                 "to": to_addresses,
@@ -1422,6 +1433,8 @@ class ClassicEmailHandler(EmailHandler):
                         EmailBodyResponse(
                             email_id=email_data["email_id"],
                             message_id=email_data.get("message_id"),
+                            in_reply_to=email_data.get("in_reply_to"),
+                            references=email_data.get("references"),
                             subject=email_data["subject"],
                             sender=email_data["from"],
                             recipients=email_data["to"],

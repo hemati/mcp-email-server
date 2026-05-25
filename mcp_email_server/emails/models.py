@@ -9,6 +9,8 @@ class EmailMetadata(BaseModel):
 
     email_id: str
     message_id: str | None = None  # RFC 5322 Message-ID header for reply threading
+    in_reply_to: str | None = None  # RFC 5322 In-Reply-To header (parent Message-ID)
+    references: str | None = None  # RFC 5322 References header (space-separated Message-ID chain)
     subject: str
     sender: str
     recipients: list[str]  # Recipient list
@@ -20,6 +22,8 @@ class EmailMetadata(BaseModel):
         return cls(
             email_id=email["email_id"],
             message_id=email.get("message_id"),
+            in_reply_to=email.get("in_reply_to"),
+            references=email.get("references"),
             subject=email["subject"],
             sender=email["from"],
             recipients=email.get("to", []),
