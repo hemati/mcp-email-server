@@ -13,6 +13,7 @@ from aioimaplib import Response
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient
+from mcp_email_server.scher_tools import _REPORTED_ENV_VARS, _SECRET_ENV_VARS, _env_overview
 
 
 @pytest.fixture
@@ -331,3 +332,68 @@ class TestHandlerDelegation:
         assert result["folder"] == "INBOX/X"
         assert result["existed"] is True
         mock.assert_called_once_with("INBOX/X")
+
+
+# ===========================================================================
+# diag env_overview — guard against drift between _REPORTED_ENV_VARS and the
+# vars upstream EmailSettings.from_env actually reads.
+# ===========================================================================
+
+
+class TestDiagEnvOverview:
+    """Pin the env-vars that diag reports.
+
+    A real bug during the IONOS 554 debugging session: FULL_NAME and
+    ENABLE_ATTACHMENT_DOWNLOAD were both read by the server at startup
+    but absent from diag's report, so operators couldn't tell whether
+    their env-var change had actually taken effect. These tests pin the
+    important vars so the gap can't silently reopen.
+    """
+
+    def test_critical_env_vars_are_reported(self):
+        """Operationally-important vars must all appear in the diag report.
+
+        These are vars whose value (or unset state) is something an operator
+        needs to verify when diagnosing send/auth/redirect issues.
+        """
+        required = {
+            "MCP_EMAIL_SERVER_ACCOUNT_NAME",
+            "MCP_EMAIL_SERVER_FULL_NAME",
+            "MCP_EMAIL_SERVER_EMAIL_ADDRESS",
+            "MCP_EMAIL_SERVER_USER_NAME",
+            "MCP_EMAIL_SERVER_IMAP_HOST",
+            "MCP_EMAIL_SERVER_SMTP_HOST",
+            "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD",
+            "MCP_EMAIL_SERVER_REDIRECT_TO",
+            "MCP_EMAIL_SERVER_PASSWORD",
+        }
+        missing = required - set(_REPORTED_ENV_VARS)
+        assert not missing, f"diag is missing env vars: {sorted(missing)}"
+
+    def test_password_vars_are_marked_secret(self):
+        """Every var whose name contains PASSWORD must be in the secret set."""
+        password_vars = {v for v in _REPORTED_ENV_VARS if "PASSWORD" in v}
+        assert password_vars <= _SECRET_ENV_VARS, (
+            f"Password-named vars not marked secret: {password_vars - _SECRET_ENV_VARS}"
+        )
+
+    def test_env_overview_masks_secrets(self, monkeypatch):
+        """Set a password value via env; diag must render it as <set:N>, never raw."""
+        fake_value = "highly-confidential-fake-test-value"
+        monkeypatch.setenv("MCP_EMAIL_SERVER_PASSWORD", fake_value)
+        overview = _env_overview()
+        assert overview["MCP_EMAIL_SERVER_PASSWORD"] == f"<set:{len(fake_value)}>"
+        # And the raw value must NOT appear anywhere in the rendered overview.
+        assert fake_value not in str(overview)
+
+    def test_env_overview_shows_non_secret_value(self, monkeypatch):
+        """Non-secret vars are passed through verbatim — that's the whole point."""
+        monkeypatch.setenv("MCP_EMAIL_SERVER_FULL_NAME", "Test User With Umlaute Ü")
+        overview = _env_overview()
+        assert overview["MCP_EMAIL_SERVER_FULL_NAME"] == "Test User With Umlaute Ü"
+
+    def test_env_overview_marks_unset(self, monkeypatch):
+        """Vars without an env value render as <unset> so operators can tell."""
+        monkeypatch.delenv("MCP_EMAIL_SERVER_FULL_NAME", raising=False)
+        overview = _env_overview()
+        assert overview["MCP_EMAIL_SERVER_FULL_NAME"] == "<unset>"

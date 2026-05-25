@@ -115,6 +115,22 @@ für Test-/Staging-Konfigurationen. Trotzdem klein und sauber, leicht herauspatc
 
 Briefing-Punkt 1 (`move_emails`) — **gestrichen**, upstream bereits umgesetzt.
 
+### 9a. Vollständige Env-Var-Abdeckung in `diag`
+
+Nachgereicht — kleiner Bugfix in `scher_tools.py::_REPORTED_ENV_VARS`.
+
+Diag hat ursprünglich `MCP_EMAIL_SERVER_FULL_NAME`, `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD`,
+`MCP_EMAIL_SERVER_IMAP_USER_NAME` und `MCP_EMAIL_SERVER_SMTP_USER_NAME` nicht
+gemeldet — alles Variablen, die upstream `EmailSettings.from_env` einliest.
+Folge: bei der IONOS-554-Debugging-Session konnte man nicht direkt aus dem
+diag-Output ablesen, ob eine ENV-Änderung (z.B. FULL_NAME ohne Umlaute zu
+testen) tatsächlich vom Server eingelesen wurde.
+
+Liste komplettiert + Regression-Tests die gegen künftige Drift schützen
+(`tests/test_scher_tools.py::TestDiagEnvOverview`).
+
+**Upstream-PR-Kandidat:** zusammen mit dem Diag-Tool selbst.
+
 ### 9. `In-Reply-To` / `References` in `EmailMetadata`
 
 Nachgereicht in Commit `49225ea` — **NEU**, Patch in bestehenden Modellen + Parsern.
