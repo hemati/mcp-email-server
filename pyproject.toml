@@ -60,8 +60,11 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.setuptools]
-py-modules = ["mcp_email_server"]
+[tool.hatch.build.targets.wheel]
+# Project distribution name is `mcp-email-server-scher` but the import
+# package is still `mcp_email_server`, so we have to tell hatchling
+# explicitly which directory to ship.
+packages = ["mcp_email_server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
