@@ -152,6 +152,34 @@ Default `None` → alte Aufrufer unverändert.
 
 **Upstream-PR-Kandidat:** ja, klar generisch nützlich.
 
+### 10. `get_attachment_as_images` — Anhang visuell lesbar machen
+
+Hinzugefügt — **NEU**, reine Scher-Extension (kein Upstream-Touch außer der
+neuen Datei + zwei Dependencies).
+
+Die Triage muss die **Quellsprache aus dem Dokument** bestimmen, nicht aus der
+Mail-Sprache (deutscher/englischer Body mit z.B. chinesischer Hongkong-Urkunde
+im Anhang). `download_attachment` speichert aber auf das **Filesystem des
+MCP-Servers** — bei remote betriebenem Server (metamcp) kann der aufrufende
+Client diese Datei nicht lesen. Dieses Tool rendert den Anhang und gibt die
+Seiten als **MCP-Image-Blocks** durch das Protokoll zurück, unabhängig von der
+Co-Location.
+
+- PDF → eine PNG-Seite pro Seite via `pymupdf` (gedeckelt durch `max_pages`).
+- Bild-Anhänge → via Pillow zu PNG normalisiert.
+- Sonst (z.B. `.docx`) → `ValueError`; Fallback ist `download_attachment`.
+- Gated durch denselben `enable_attachment_download`-Toggle wie
+  `download_attachment`.
+- Implementierung: reiner Renderer (`_render_attachment_to_images`) +
+  `_attachment_images_impl`, das das bestehende `download_attachment` in ein
+  **temporäres Server-Verzeichnis** schreibt, die Bytes zurückliest, rendert
+  und das Temp-File verwirft — kein Upstream-Refactor nötig.
+- Neue Dependencies: `pymupdf` (PDF-Rasterung), `pillow` (Bild-Normalisierung,
+  direkt genutzt statt nur transitiv über gradio).
+
+**Upstream-PR-Kandidat:** evtl. — Image-Content-Rückgabe ist generisch nützlich,
+hängt aber an der PDF-Dependency.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
@@ -162,12 +190,13 @@ Stand nach Implementierung der Patches (wird laufend aktualisiert):
 | `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
 | `mcp_email_server/emails/models.py`   | `EmailMetadata` (und damit transitiv `EmailBodyResponse`) bekommen optionale Felder `in_reply_to`, `references`; `from_email`-Classmethod propagiert sie                                  | Data shape        |
 | `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                                                  | Tool-Surface      |
-| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`-Tool-Wrappern + `register_scher_tools()`-Funktion                                                                   | Scher Extensions  |
+| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `register_scher_tools()`-Funktion                    | Scher Extensions  |
 | `tests/test_scher_tools.py`           | **neue Datei** mit Mock-Tests für alle neuen Tools                                                                                                                                         | Testabdeckung     |
+| `tests/test_attachment_images.py`     | **neue Datei** mit Tests für `_render_attachment_to_images` + `_attachment_images_impl` (PDF/Bild/unsupported, Gate)                                                                       | Testabdeckung     |
 | `tests/test_send_email_extensions.py` | **neue Datei** mit Tests für `message_id` und `REDIRECT_TO`                                                                                                                                | Regression-Schutz |
 | `tests/test_email_client.py`          | Tests für `In-Reply-To`/`References`-Parsing in beiden Parse-Pfaden (`_parse_email_data`, `_parse_headers`)                                                                              | Regression-Schutz |
 | `tests/test_models.py`                | Tests für `EmailMetadata.from_email` mit/ohne Reply-Header                                                                                                                              | Regression-Schutz |
-| `pyproject.toml`                      | `name` → `mcp-email-server-scher`, Entry-Point angepasst, hatchling wheel-package explizit                                                                                                | Distribution      |
+| `pyproject.toml`                      | `name` → `mcp-email-server-scher`, Entry-Point angepasst, hatchling wheel-package explizit; Dependencies `pillow` + `pymupdf` für `get_attachment_as_images`                              | Distribution      |
 | `README.md`                           | Neue Sektion "Scher Extensions"                                                                                                                                                            | Doku              |
 
 ## Upstream-Sync-Strategie

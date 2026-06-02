@@ -13,9 +13,11 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import tempfile
+from pathlib import Path
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
 from mcp_email_server.config import EmailSettings, get_settings
@@ -159,6 +161,129 @@ async def _smtp_login_check(account: EmailSettings) -> dict[str, Any]:
         await smtp.login(outgoing.user_name, outgoing.password.get_secret_value())
         await smtp.noop()
     return {"ok": True, "detail": "login + NOOP succeeded"}
+
+
+# --- Attachment → images (visual classification) ---------------------------
+# parse-customer-anfrage must SEE the document to determine its real source
+# language — the email body language is unreliable (e.g. a German email with a
+# Chinese Hong-Kong certificate). download_attachment writes to the MCP
+# server's filesystem, which a remote caller can't read; this path renders the
+# attachment and returns the pages back through the MCP protocol instead.
+
+_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"}
+_MAX_RENDER_PAGES = 10
+_DEFAULT_DPI = 150
+
+
+def _ext(filename: str) -> str:
+    return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
+def _looks_like_pdf(mime_type: str, filename: str) -> bool:
+    return (mime_type or "").lower() == "application/pdf" or _ext(filename) == "pdf"
+
+
+def _looks_like_image(mime_type: str, filename: str) -> bool:
+    return (mime_type or "").lower().startswith("image/") or _ext(filename) in _IMAGE_EXTS
+
+
+def _pdf_to_png_pages(data: bytes, max_pages: int, dpi: int) -> tuple[list[bytes], int]:
+    """Rasterize up to ``max_pages`` PDF pages to PNG bytes. Returns (pngs, total_pages)."""
+    try:
+        import pymupdf  # PyMuPDF >= 1.24 exposes the modern import name
+    except ImportError:  # pragma: no cover - legacy releases only ship `fitz`
+        import fitz as pymupdf
+
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        total = doc.page_count
+        zoom = max(dpi, 1) / 72.0
+        matrix = pymupdf.Matrix(zoom, zoom)
+        pngs = [doc[i].get_pixmap(matrix=matrix).tobytes("png") for i in range(min(total, max(max_pages, 1)))]
+        return pngs, total
+    finally:
+        doc.close()
+
+
+def _image_to_png(data: bytes) -> bytes:
+    """Normalize any Pillow-readable image to PNG bytes for consistent rendering."""
+    import io
+
+    from PIL import Image as PILImage
+
+    with PILImage.open(io.BytesIO(data)) as img:
+        normalized = img if img.mode in ("RGB", "RGBA", "L") else img.convert("RGB")
+        buffer = io.BytesIO()
+        normalized.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+def _render_attachment_to_images(
+    data: bytes,
+    mime_type: str,
+    filename: str,
+    max_pages: int = _MAX_RENDER_PAGES,
+    dpi: int = _DEFAULT_DPI,
+) -> tuple[list[Image], str]:
+    """Render a PDF or image attachment to PNG :class:`Image` blocks.
+
+    Returns ``(images, summary)``. Raises ``ValueError`` for types that cannot be
+    rendered (e.g. .docx) so the caller can fall back to ``download_attachment``.
+    """
+    if _looks_like_pdf(mime_type, filename):
+        pngs, total = _pdf_to_png_pages(data, max_pages, dpi)
+        images = [Image(data=png, format="png") for png in pngs]
+        truncated = total > len(images)
+        summary = f"{filename}: PDF, {total} page(s), {len(images)} rendered @ {dpi} dpi" + (
+            " — TRUNCATED, raise max_pages to see the rest" if truncated else ""
+        )
+        return images, summary
+
+    if _looks_like_image(mime_type, filename):
+        png = _image_to_png(data)
+        return [Image(data=png, format="png")], f"{filename}: image ({mime_type or 'unknown'})"
+
+    msg = (
+        f"Cannot render attachment {filename!r} (type {mime_type or 'unknown'}) as image. "
+        "Only PDF and image attachments are supported — download it with download_attachment instead."
+    )
+    raise ValueError(msg)
+
+
+async def _attachment_images_impl(
+    account_name: str,
+    email_id: str,
+    attachment_name: str,
+    mailbox: str,
+    max_pages: int,
+    dpi: int,
+) -> list:
+    """Fetch an attachment via the existing download path and render it to images.
+
+    Reuses ``handler.download_attachment`` (battle-tested IMAP fetch + MIME walk)
+    but writes to a server-local temp dir instead of a caller-supplied path — the
+    caller can't read the server's filesystem when the MCP runs remotely. The
+    bytes are read back, rendered, and the temp file is discarded.
+    """
+    settings = get_settings()
+    if not settings.enable_attachment_download:
+        msg = (
+            "Attachment access is disabled. Set 'enable_attachment_download=true' "
+            "in settings to enable this feature."
+        )
+        raise PermissionError(msg)
+
+    handler = dispatch_handler(account_name)
+
+    with tempfile.TemporaryDirectory(prefix="scher_att_") as tmpdir:
+        tmp_path = os.path.join(tmpdir, os.path.basename(attachment_name) or "attachment")
+        result = await handler.download_attachment(email_id, attachment_name, tmp_path, mailbox)
+        mime_type = (result or {}).get("mime_type", "application/octet-stream")
+        data = Path(tmp_path).read_bytes()
+
+    images, summary = _render_attachment_to_images(data, mime_type, attachment_name, max_pages, dpi)
+    logger.info(f"get_attachment_as_images: {summary}")
+    return [summary, *images]
 
 
 def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
@@ -337,4 +462,37 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
 
         return {"account": account_name, "checks": checks}
 
-    logger.info("Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag")
+    @mcp.tool(
+        description=(
+            "Fetch an email attachment and return it as rendered PNG image "
+            "block(s) so the model can VISUALLY read it — WITHOUT writing to the "
+            "MCP server's filesystem (unlike download_attachment, whose saved "
+            "file a remote caller usually cannot reach). PDFs are rasterized one "
+            "image per page (capped by max_pages); image attachments are "
+            "normalized to PNG. Use this to determine a document's true "
+            "language/script and type — e.g. a Hong Kong certificate that is "
+            "Chinese even though the email body is German. Unsupported types "
+            "(e.g. .docx) raise an error. Requires enable_attachment_download=true."
+        )
+    )
+    async def get_attachment_as_images(
+        account_name: Annotated[str, Field(description="The name of the email account.")],
+        email_id: Annotated[
+            str, Field(description="The email UID (from list_emails_metadata / get_emails_content).")
+        ],
+        attachment_name: Annotated[
+            str, Field(description="The attachment filename, exactly as listed in get_emails_content.")
+        ],
+        mailbox: Annotated[str, Field(default="INBOX", description="The mailbox containing the email.")] = "INBOX",
+        max_pages: Annotated[
+            int, Field(default=_MAX_RENDER_PAGES, description="Max PDF pages to render (caps response size).")
+        ] = _MAX_RENDER_PAGES,
+        dpi: Annotated[
+            int, Field(default=_DEFAULT_DPI, description="Render resolution for PDF pages (72-300 sensible).")
+        ] = _DEFAULT_DPI,
+    ):
+        return await _attachment_images_impl(account_name, email_id, attachment_name, mailbox, max_pages, dpi)
+
+    logger.info(
+        "Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag, get_attachment_as_images"
+    )
