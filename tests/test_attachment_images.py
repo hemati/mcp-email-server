@@ -22,6 +22,7 @@ from mcp_email_server.emails.models import AttachmentDownloadResponse
 from mcp_email_server.scher_tools import (
     _attachment_images_impl,
     _render_attachment_to_images,
+    _shrink_png_to_budget,
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -42,6 +43,16 @@ def _make_pdf(pages: int) -> bytes:
 def _make_image(fmt: str, color=(200, 30, 30), size=(24, 24)) -> bytes:
     buf = io.BytesIO()
     PILImage.new("RGB", size, color).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _make_big_noise_png(side: int = 1600) -> bytes:
+    """A large, poorly-compressible PNG (noise) — guaranteed to exceed the budget."""
+    import os
+
+    img = PILImage.frombytes("RGB", (side, side), os.urandom(side * side * 3))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -81,6 +92,21 @@ class TestRenderAttachment:
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 "cv.docx",
             )
+
+
+class TestShrinkToBudget:
+    def test_small_png_passes_through_unchanged(self):
+        png = _make_image("PNG")
+        # under budget → returned as-is (identity, no re-encode)
+        assert _shrink_png_to_budget(png, 1_000_000) is png
+
+    def test_oversized_png_is_shrunk_under_budget(self):
+        big = _make_big_noise_png(1600)
+        assert len(big) > 1_200_000  # sanity: original exceeds budget
+        out = _shrink_png_to_budget(big, 1_200_000)
+        assert len(out) <= 1_200_000
+        assert out.startswith(PNG_MAGIC)
+        assert len(out) < len(big)
 
 
 class TestAttachmentImagesImpl:

@@ -172,7 +172,13 @@ async def _smtp_login_check(account: EmailSettings) -> dict[str, Any]:
 
 _IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"}
 _MAX_RENDER_PAGES = 10
-_DEFAULT_DPI = 150
+_DEFAULT_DPI = 100
+# Per-image payload budget. A single oversized base64 image block overflows the
+# MCP transport/connector ("Maximum call stack size exceeded"), so every rendered
+# page is downscaled below this before it leaves the server. The long edge is
+# never shrunk below _MIN_IMAGE_EDGE (kept legible for script/type detection).
+_MAX_IMAGE_BYTES = 1_200_000
+_MIN_IMAGE_EDGE = 400
 
 
 def _ext(filename: str) -> str:
@@ -218,6 +224,35 @@ def _image_to_png(data: bytes) -> bytes:
         return buffer.getvalue()
 
 
+def _shrink_png_to_budget(png: bytes, max_bytes: int = _MAX_IMAGE_BYTES) -> bytes:
+    """Downscale a PNG until it fits ``max_bytes`` (best effort).
+
+    One oversized base64 image block overflows the connector, so each page is
+    capped here. Real documents stay legible at the reduced size; the long edge
+    is not shrunk below ``_MIN_IMAGE_EDGE``.
+    """
+    if len(png) <= max_bytes:
+        return png
+
+    import io
+
+    from PIL import Image as PILImage
+
+    with PILImage.open(io.BytesIO(png)) as opened:
+        img = opened.convert("RGB") if opened.mode not in ("RGB", "RGBA", "L") else opened.copy()
+
+    data = png
+    while len(data) > max_bytes and max(img.size) > _MIN_IMAGE_EDGE:
+        img = img.resize(
+            (max(1, int(img.width * 0.8)), max(1, int(img.height * 0.8))),
+            PILImage.LANCZOS,
+        )
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG", optimize=True)
+        data = buffer.getvalue()
+    return data
+
+
 def _render_attachment_to_images(
     data: bytes,
     mime_type: str,
@@ -232,7 +267,7 @@ def _render_attachment_to_images(
     """
     if _looks_like_pdf(mime_type, filename):
         pngs, total = _pdf_to_png_pages(data, max_pages, dpi)
-        images = [Image(data=png, format="png") for png in pngs]
+        images = [Image(data=_shrink_png_to_budget(png), format="png") for png in pngs]
         truncated = total > len(images)
         summary = f"{filename}: PDF, {total} page(s), {len(images)} rendered @ {dpi} dpi" + (
             " — TRUNCATED, raise max_pages to see the rest" if truncated else ""
@@ -240,7 +275,7 @@ def _render_attachment_to_images(
         return images, summary
 
     if _looks_like_image(mime_type, filename):
-        png = _image_to_png(data)
+        png = _shrink_png_to_budget(_image_to_png(data))
         return [Image(data=png, format="png")], f"{filename}: image ({mime_type or 'unknown'})"
 
     msg = (

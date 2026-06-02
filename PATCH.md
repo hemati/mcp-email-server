@@ -165,8 +165,11 @@ Client diese Datei nicht lesen. Dieses Tool rendert den Anhang und gibt die
 Seiten als **MCP-Image-Blocks** durch das Protokoll zurück, unabhängig von der
 Co-Location.
 
-- PDF → eine PNG-Seite pro Seite via `pymupdf` (gedeckelt durch `max_pages`).
+- PDF → eine PNG-Seite pro Seite via `pymupdf` (Default 100 dpi, gedeckelt durch `max_pages`).
 - Bild-Anhänge → via Pillow zu PNG normalisiert.
+- Jede Seite wird auf ein Byte-Budget (`_MAX_IMAGE_BYTES`) herunterskaliert, damit
+  kein einzelner Base64-Block den MCP-Transport sprengt („Maximum call stack size
+  exceeded" im Connector bei großen Scans).
 - Sonst (z.B. `.docx`) → `ValueError`; Fallback ist `download_attachment`.
 - Gated durch denselben `enable_attachment_download`-Toggle wie
   `download_attachment`.
