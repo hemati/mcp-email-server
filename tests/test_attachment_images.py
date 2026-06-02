@@ -18,6 +18,7 @@ import pytest
 from mcp.server.fastmcp import Image
 from PIL import Image as PILImage
 
+from mcp_email_server.emails.models import AttachmentDownloadResponse
 from mcp_email_server.scher_tools import (
     _attachment_images_impl,
     _render_attachment_to_images,
@@ -91,7 +92,15 @@ class TestAttachmentImagesImpl:
         async def fake_download(email_id, attachment_name, save_path, mailbox):
             saved_paths.append(save_path)
             Path(save_path).write_bytes(pdf)
-            return {"mime_type": "application/pdf", "size": len(pdf), "saved_path": save_path}
+            # real handler returns a Pydantic model, NOT a dict — must match so
+            # attribute-vs-.get() regressions are caught here, not in production
+            return AttachmentDownloadResponse(
+                email_id=email_id,
+                attachment_name=attachment_name,
+                mime_type="application/pdf",
+                size=len(pdf),
+                saved_path=save_path,
+            )
 
         handler = AsyncMock()
         handler.download_attachment = AsyncMock(side_effect=fake_download)
@@ -108,6 +117,37 @@ class TestAttachmentImagesImpl:
         handler.download_attachment.assert_awaited_once()
         # temp file must be cleaned up after the call
         assert saved_paths and not Path(saved_paths[0]).exists()
+
+    @pytest.mark.asyncio
+    async def test_response_mime_type_drives_detection(self):
+        """An attachment with no file extension is classified via the response mime_type.
+
+        Guards that the response's mime_type is actually read (not silently
+        dropped to octet-stream, which would only render thanks to extensions).
+        """
+        png = _make_image("PNG")
+
+        async def fake_download(email_id, attachment_name, save_path, mailbox):
+            Path(save_path).write_bytes(png)
+            return AttachmentDownloadResponse(
+                email_id=email_id,
+                attachment_name=attachment_name,
+                mime_type="image/png",
+                size=len(png),
+                saved_path=save_path,
+            )
+
+        handler = AsyncMock()
+        handler.download_attachment = AsyncMock(side_effect=fake_download)
+        enabled = SimpleNamespace(enable_attachment_download=True)
+
+        with (
+            patch("mcp_email_server.scher_tools.get_settings", return_value=enabled),
+            patch("mcp_email_server.scher_tools.dispatch_handler", return_value=handler),
+        ):
+            result = await _attachment_images_impl("scher", "9", "scan_no_ext", "INBOX", 10, 150)
+
+        assert any(isinstance(x, Image) for x in result[1:])
 
     @pytest.mark.asyncio
     async def test_gate_blocks_when_download_disabled(self):

@@ -278,7 +278,10 @@ async def _attachment_images_impl(
     with tempfile.TemporaryDirectory(prefix="scher_att_") as tmpdir:
         tmp_path = os.path.join(tmpdir, os.path.basename(attachment_name) or "attachment")
         result = await handler.download_attachment(email_id, attachment_name, tmp_path, mailbox)
-        mime_type = (result or {}).get("mime_type", "application/octet-stream")
+        # handler.download_attachment returns an AttachmentDownloadResponse model
+        # (attribute access); be defensive about a dict too.
+        mime_type = result.get("mime_type") if isinstance(result, dict) else getattr(result, "mime_type", None)
+        mime_type = mime_type or "application/octet-stream"
         data = Path(tmp_path).read_bytes()
 
     images, summary = _render_attachment_to_images(data, mime_type, attachment_name, max_pages, dpi)

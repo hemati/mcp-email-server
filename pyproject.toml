@@ -1,6 +1,6 @@
 [project]
 name = "mcp-email-server-scher"
-version = "0.1.4"
+version = "0.1.5"
 description = "IMAP and SMTP via MCP Server — Scher Extensions fork of ai-zerolab/mcp-email-server with mark_seen/mark_unseen, ensure_folder, diag, custom Message-ID and test-mode redirect"
 authors = [
     { name = "ai-zerolab", email = "jizhongsheng957@gmail.com" },
