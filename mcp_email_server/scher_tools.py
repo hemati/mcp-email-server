@@ -11,6 +11,8 @@ and the rationale for each extension.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import os
 import socket
 import tempfile
@@ -366,6 +368,43 @@ async def _attachment_images_impl(
     images, summary = _render_attachment_to_images(data, mime_type, attachment_name, max_pages, dpi)
     logger.info(f"get_attachment_as_images: {summary}")
     return [summary, *images]
+
+
+# --- Inline attachments (send locally-generated files through the protocol) ---
+# send_email attaches files from the SERVER filesystem; a file generated on the
+# (remote) caller's side — e.g. an offer PDF from scher/pdf.py — isn't there.
+# These arrive as base64 and are materialized to a server temp dir for sending.
+
+_MAX_INLINE_ATTACHMENT_BYTES = 8_000_000  # decoded total per request (SMTP / connector sanity)
+
+
+def materialize_inline_attachments(attachments_inline: list[dict], tmpdir: str) -> list[str]:
+    """Decode ``[{"filename", "content_base64"}, ...]`` into files under ``tmpdir``.
+
+    Returns the written file paths (for the send path). The caller owns ``tmpdir``
+    and its cleanup. Raises ``ValueError`` on invalid base64, empty content, or
+    when the decoded total exceeds ``_MAX_INLINE_ATTACHMENT_BYTES``.
+    """
+    paths: list[str] = []
+    total = 0
+    for index, item in enumerate(attachments_inline):
+        item = item or {}
+        filename = os.path.basename(str(item.get("filename") or "").strip()) or f"attachment-{index + 1}"
+        try:
+            data = base64.b64decode(item.get("content_base64") or "", validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"Inline-Anhang {filename!r}: ungültiges base64 ({e}).") from e
+        if not data:
+            raise ValueError(f"Inline-Anhang {filename!r}: leer nach base64-Dekodierung.")
+        total += len(data)
+        if total > _MAX_INLINE_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"Inline-Anhänge überschreiten {_MAX_INLINE_ATTACHMENT_BYTES} Bytes (dekodiert) — zu groß für den Versand."
+            )
+        path = os.path.join(tmpdir, filename)
+        Path(path).write_bytes(data)
+        paths.append(path)
+    return paths
 
 
 def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901

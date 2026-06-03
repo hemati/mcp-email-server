@@ -145,6 +145,18 @@ async def send_email(
             description="A list of absolute file paths to attach to the email. Supports common file types (documents, images, archives, etc.).",
         ),
     ] = None,
+    attachments_inline: Annotated[
+        list[dict[str, str]] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments provided inline as base64 — for files the caller cannot place on the "
+                "server's filesystem (e.g. a locally generated PDF when the MCP runs remotely). Each "
+                'item: {"filename": str, "content_base64": str}. Decoded server-side, attached, and '
+                "discarded. Can be combined with `attachments`."
+            ),
+        ),
+    ] = None,
     in_reply_to: Annotated[
         str | None,
         Field(
@@ -170,21 +182,32 @@ async def send_email(
         ),
     ] = None,
 ) -> str:
+    import contextlib
+    import tempfile
+
+    from mcp_email_server.scher_tools import materialize_inline_attachments
+
     handler = dispatch_handler(account_name)
-    await handler.send_email(
-        recipients,
-        subject,
-        body,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
-        message_id,
-    )
+    with contextlib.ExitStack() as stack:
+        all_attachments = list(attachments or [])
+        if attachments_inline:
+            tmpdir = stack.enter_context(tempfile.TemporaryDirectory(prefix="scher_inline_"))
+            all_attachments += materialize_inline_attachments(attachments_inline, tmpdir)
+        await handler.send_email(
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            all_attachments or None,
+            in_reply_to,
+            references,
+            message_id,
+        )
     recipient_str = ", ".join(recipients)
-    attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+    total_attachments = len(attachments or []) + len(attachments_inline or [])
+    attachment_info = f" with {total_attachments} attachment(s)" if total_attachments else ""
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 

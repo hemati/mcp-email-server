@@ -183,6 +183,27 @@ Co-Location.
 **Upstream-PR-Kandidat:** evtl. — Image-Content-Rückgabe ist generisch nützlich,
 hängt aber an der PDF-Dependency.
 
+### 11. `send_email` — Inline-base64-Anhänge
+
+Hinzugefügt — **NEU** (v0.1.8). `send_email` bekommt einen optionalen Parameter
+`attachments_inline: [{filename, content_base64}]` neben dem bestehenden
+`attachments` (Server-Pfade).
+
+Gegenstück zum Remote-FS-Problem in Senderichtung: `send_email(attachments=…)`
+liest vom **Server-FS**, aber `send-offer-to-scher` erzeugt das Angebots-PDF via
+`scher/pdf.py` auf **Claudes** FS — die Datei liegt also nicht auf dem Server.
+Inline-base64 schickt die Bytes durchs MCP-Protokoll; der Server dekodiert sie in
+ein TemporaryDirectory, hängt sie an und verwirft sie.
+
+- Helper `materialize_inline_attachments()` in `scher_tools.py` (base64-Dekode +
+  Path-Traversal-Schutz via `basename` + Größen-Cap `_MAX_INLINE_ATTACHMENT_BYTES`).
+- `app.py::send_email` materialisiert via `contextlib.ExitStack` + `TemporaryDirectory`,
+  merged mit `attachments`, ein `handler.send_email`-Call. Keine Handler-/`classic.py`-Änderung.
+- Bewusst **ohne** gzip: PDFs sind intern schon komprimiert, der Gewinn wäre
+  marginal — weniger Code-Komplexität.
+
+**Upstream-PR-Kandidat:** ja — generisch nützlich für headless/remote-Clients.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
@@ -192,8 +213,8 @@ Stand nach Implementierung der Patches (wird laufend aktualisiert):
 | `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` erweitert                                                                                      | Handler-Interface |
 | `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
 | `mcp_email_server/emails/models.py`   | `EmailMetadata` (und damit transitiv `EmailBodyResponse`) bekommen optionale Felder `in_reply_to`, `references`; `from_email`-Classmethod propagiert sie                                  | Data shape        |
-| `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                                                  | Tool-Surface      |
-| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `register_scher_tools()`-Funktion                    | Scher Extensions  |
+| `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` + `attachments_inline` (base64) erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                  | Tool-Surface      |
+| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `materialize_inline_attachments()` + `register_scher_tools()`-Funktion | Scher Extensions  |
 | `tests/test_scher_tools.py`           | **neue Datei** mit Mock-Tests für alle neuen Tools                                                                                                                                         | Testabdeckung     |
 | `tests/test_attachment_images.py`     | **neue Datei** mit Tests für `_render_attachment_to_images` + `_attachment_images_impl` (PDF/Bild/unsupported, Gate)                                                                       | Testabdeckung     |
 | `tests/test_send_email_extensions.py` | **neue Datei** mit Tests für `message_id` und `REDIRECT_TO`                                                                                                                                | Regression-Schutz |

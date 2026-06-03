@@ -9,6 +9,7 @@ Uses synthetic PDFs/images only — never real production data.
 
 from __future__ import annotations
 
+import base64
 import io
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from mcp_email_server.scher_tools import (
     _attachment_images_impl,
     _encode_within_budget,
     _render_attachment_to_images,
+    materialize_inline_attachments,
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -229,3 +231,33 @@ class TestAttachmentImagesImpl:
         with patch("mcp_email_server.scher_tools.get_settings", return_value=disabled):
             with pytest.raises(PermissionError):
                 await _attachment_images_impl("scher", "4", "doc.pdf", "INBOX", 10, 150)
+
+
+class TestMaterializeInlineAttachments:
+    def test_decodes_base64_to_files(self, tmp_path):
+        payload = b"%PDF-1.4 offer body"
+        items = [{"filename": "offer.pdf", "content_base64": base64.b64encode(payload).decode()}]
+        paths = materialize_inline_attachments(items, str(tmp_path))
+        assert len(paths) == 1
+        assert Path(paths[0]).name == "offer.pdf"
+        assert Path(paths[0]).read_bytes() == payload
+
+    def test_strips_directory_components_from_filename(self, tmp_path):
+        # path traversal guard: basename only, written inside tmpdir
+        items = [{"filename": "../../etc/evil.pdf", "content_base64": base64.b64encode(b"x").decode()}]
+        paths = materialize_inline_attachments(items, str(tmp_path))
+        assert Path(paths[0]).parent == tmp_path
+        assert Path(paths[0]).name == "evil.pdf"
+
+    def test_invalid_base64_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="base64"):
+            materialize_inline_attachments([{"filename": "x.pdf", "content_base64": "!!!not-base64!!!"}], str(tmp_path))
+
+    def test_empty_content_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="leer"):
+            materialize_inline_attachments([{"filename": "x.pdf", "content_base64": ""}], str(tmp_path))
+
+    def test_over_cap_raises(self, tmp_path):
+        big = base64.b64encode(b"\x00" * 9_000_000).decode()  # > 8 MB decoded
+        with pytest.raises(ValueError, match=r"überschreiten|groß"):
+            materialize_inline_attachments([{"filename": "big.bin", "content_base64": big}], str(tmp_path))
