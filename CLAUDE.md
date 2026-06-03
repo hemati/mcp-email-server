@@ -15,3 +15,5 @@ Fork von ai-zerolab/mcp-email-server — Source für den `Wahed-Scher`-MCP der S
 ## Release / Deploy
 - Git-Tag `vX.Y.Z-scher` + `pyproject` `version` mitziehen. **Veröffentlichte Tags nie verschieben** — immer neuer Tag.
 - metamcp deployt via `uvx --from git+https://github.com/hemati/mcp-email-server@vX.Y.Z-scher mcp-email-server-scher stdio`. Nach neuem Tag: in metamcp das `@…`-Argument bumpen + reconnecten. Neuer/geänderter Tool → der claude.ai-Connector cached das Manifest, ggf. Connector-Re-List nötig (nicht nur `/mcp reconnect`).
+- **ENV-Änderungen** (`REDIRECT_TO`, `ENABLE_ATTACHMENT_DOWNLOAD`, …) greifen erst nach **Neustart des Server-Prozesses** — in metamcp den *Server* reconnecten (respawnt `uvx`, liest ENV neu). Ein claude.ai-`/mcp reconnect` reicht NICHT (ENV wird nur beim Prozess-Start gelesen).
+- **Per `diag` verifizieren statt annehmen:** zeigt `REDIRECT_TO`, `ENABLE_ATTACHMENT_DOWNLOAD` etc. (Passwörter maskiert) — fängt „geändert, aber alter Prozess läuft noch".
