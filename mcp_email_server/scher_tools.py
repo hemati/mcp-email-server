@@ -212,45 +212,78 @@ def _pdf_to_png_pages(data: bytes, max_pages: int, dpi: int) -> tuple[list[bytes
 
 
 def _image_to_png(data: bytes) -> bytes:
-    """Normalize any Pillow-readable image to PNG bytes for consistent rendering."""
+    """Normalize any Pillow-readable image to PNG bytes for consistent rendering.
+
+    Alpha is preserved: ``LA``/``PA`` and transparent palette images become
+    ``RGBA`` instead of being silently flattened to ``RGB``.
+    """
     import io
 
     from PIL import Image as PILImage
 
     with PILImage.open(io.BytesIO(data)) as img:
-        normalized = img if img.mode in ("RGB", "RGBA", "L") else img.convert("RGB")
+        if img.mode in ("RGB", "RGBA", "L"):
+            normalized = img
+        elif img.mode in ("LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+            normalized = img.convert("RGBA")
+        else:
+            normalized = img.convert("RGB")
         buffer = io.BytesIO()
         normalized.save(buffer, format="PNG")
         return buffer.getvalue()
 
 
-def _shrink_png_to_budget(png: bytes, max_bytes: int = _MAX_IMAGE_BYTES) -> bytes:
-    """Downscale a PNG until it fits ``max_bytes`` (best effort).
+def _encode_within_budget(png: bytes, max_bytes: int = _MAX_IMAGE_BYTES) -> tuple[bytes, str]:
+    """Return ``(image_bytes, format)`` GUARANTEED to fit ``max_bytes``.
 
-    One oversized base64 image block overflows the connector, so each page is
-    capped here. Real documents stay legible at the reduced size; the long edge
-    is not shrunk below ``_MIN_IMAGE_EDGE``.
+    A single oversized base64 image block overflows the MCP connector, so the
+    budget is a hard ceiling — not best effort. Strategy: downscale the PNG
+    (lossless, keeps text legible) until it fits or the long edge hits
+    ``_MIN_IMAGE_EDGE``; if it still won't fit, fall back to JPEG (document scans
+    compress far better), stepping quality — then size — down until it fits.
+    ``format`` is ``"png"`` or ``"jpeg"`` for the :class:`Image` block.
     """
     if len(png) <= max_bytes:
-        return png
+        return png, "png"
 
     import io
 
     from PIL import Image as PILImage
 
     with PILImage.open(io.BytesIO(png)) as opened:
-        img = opened.convert("RGB") if opened.mode not in ("RGB", "RGBA", "L") else opened.copy()
+        img = opened.copy()
 
+    # 1) Lossless downscale as PNG.
     data = png
     while len(data) > max_bytes and max(img.size) > _MIN_IMAGE_EDGE:
-        img = img.resize(
-            (max(1, int(img.width * 0.8)), max(1, int(img.height * 0.8))),
-            PILImage.LANCZOS,
-        )
+        img = img.resize((max(1, int(img.width * 0.8)), max(1, int(img.height * 0.8))), PILImage.LANCZOS)
         buffer = io.BytesIO()
         img.save(buffer, format="PNG", optimize=True)
         data = buffer.getvalue()
-    return data
+    if len(data) <= max_bytes:
+        return data, "png"
+
+    # 2) Still over budget at the floor → JPEG. Flatten alpha onto white, then
+    #    step quality (and, if needed, size) down until it fits. Terminates.
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        flat = PILImage.new("RGB", rgba.size, (255, 255, 255))
+        flat.paste(rgba, mask=rgba.split()[-1])
+        rgb = flat
+    else:
+        rgb = img.convert("RGB")
+    for quality in (80, 60, 45, 30, 20):
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= max_bytes:
+            return data, "jpeg"
+    while len(data) > max_bytes and max(rgb.size) > 100:
+        rgb = rgb.resize((max(1, int(rgb.width * 0.7)), max(1, int(rgb.height * 0.7))), PILImage.LANCZOS)
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=30, optimize=True)
+        data = buffer.getvalue()
+    return data, "jpeg"
 
 
 def _render_attachment_to_images(
@@ -266,8 +299,13 @@ def _render_attachment_to_images(
     rendered (e.g. .docx) so the caller can fall back to ``download_attachment``.
     """
     if _looks_like_pdf(mime_type, filename):
-        pngs, total = _pdf_to_png_pages(data, max_pages, dpi)
-        images = [Image(data=_shrink_png_to_budget(png), format="png") for png in pngs]
+        try:
+            pngs, total = _pdf_to_png_pages(data, max_pages, dpi)
+        except Exception as e:  # corrupt/empty PDF → actionable error, not a raw decoder crash
+            raise ValueError(f"Konnte PDF {filename!r} ({mime_type or 'unknown'}) nicht rendern: {e}") from e
+        if total == 0 or not pngs:
+            raise ValueError(f"PDF {filename!r} hat keine renderbaren Seiten.")
+        images = [Image(data=blob, format=fmt) for blob, fmt in (_encode_within_budget(p) for p in pngs)]
         truncated = total > len(images)
         summary = f"{filename}: PDF, {total} page(s), {len(images)} rendered @ {dpi} dpi" + (
             " — TRUNCATED, raise max_pages to see the rest" if truncated else ""
@@ -275,8 +313,11 @@ def _render_attachment_to_images(
         return images, summary
 
     if _looks_like_image(mime_type, filename):
-        png = _shrink_png_to_budget(_image_to_png(data))
-        return [Image(data=png, format="png")], f"{filename}: image ({mime_type or 'unknown'})"
+        try:
+            blob, fmt = _encode_within_budget(_image_to_png(data))
+        except Exception as e:  # corrupt/unsupported image bytes → actionable error
+            raise ValueError(f"Konnte Bild {filename!r} ({mime_type or 'unknown'}) nicht rendern: {e}") from e
+        return [Image(data=blob, format=fmt)], f"{filename}: image ({mime_type or 'unknown'})"
 
     msg = (
         f"Cannot render attachment {filename!r} (type {mime_type or 'unknown'}) as image. "
@@ -318,6 +359,9 @@ async def _attachment_images_impl(
         mime_type = result.get("mime_type") if isinstance(result, dict) else getattr(result, "mime_type", None)
         mime_type = mime_type or "application/octet-stream"
         data = Path(tmp_path).read_bytes()
+
+    if not data:
+        raise ValueError(f"Attachment {attachment_name!r} ist leer (0 Bytes) — nichts zu rendern.")
 
     images, summary = _render_attachment_to_images(data, mime_type, attachment_name, max_pages, dpi)
     logger.info(f"get_attachment_as_images: {summary}")
@@ -514,19 +558,20 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
         )
     )
     async def get_attachment_as_images(
-        account_name: Annotated[str, Field(description="The name of the email account.")],
+        account_name: Annotated[str, Field(min_length=1, description="The name of the email account.")],
         email_id: Annotated[
-            str, Field(description="The email UID (from list_emails_metadata / get_emails_content).")
+            str, Field(min_length=1, description="The email UID (from list_emails_metadata / get_emails_content).")
         ],
         attachment_name: Annotated[
-            str, Field(description="The attachment filename, exactly as listed in get_emails_content.")
+            str, Field(min_length=1, description="The attachment filename, exactly as listed in get_emails_content.")
         ],
         mailbox: Annotated[str, Field(default="INBOX", description="The mailbox containing the email.")] = "INBOX",
         max_pages: Annotated[
-            int, Field(default=_MAX_RENDER_PAGES, description="Max PDF pages to render (caps response size).")
+            int,
+            Field(default=_MAX_RENDER_PAGES, ge=1, le=20, description="Max PDF pages to render (caps response size)."),
         ] = _MAX_RENDER_PAGES,
         dpi: Annotated[
-            int, Field(default=_DEFAULT_DPI, description="Render resolution for PDF pages (72-300 sensible).")
+            int, Field(default=_DEFAULT_DPI, ge=72, le=300, description="Render resolution for PDF pages.")
         ] = _DEFAULT_DPI,
     ):
         return await _attachment_images_impl(account_name, email_id, attachment_name, mailbox, max_pages, dpi)

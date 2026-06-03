@@ -21,11 +21,12 @@ from PIL import Image as PILImage
 from mcp_email_server.emails.models import AttachmentDownloadResponse
 from mcp_email_server.scher_tools import (
     _attachment_images_impl,
+    _encode_within_budget,
     _render_attachment_to_images,
-    _shrink_png_to_budget,
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
 
 
 def _make_pdf(pages: int) -> bytes:
@@ -93,20 +94,44 @@ class TestRenderAttachment:
                 "cv.docx",
             )
 
+    def test_corrupt_pdf_raises_value_error(self):
+        # garbage bytes → pymupdf raises → wrapped as an actionable ValueError,
+        # not a raw decoder crash leaking to the caller
+        with pytest.raises(ValueError, match="rendern"):
+            _render_attachment_to_images(b"definitely-not-a-pdf", "application/pdf", "broken.pdf")
 
-class TestShrinkToBudget:
+    def test_zero_page_pdf_raises_value_error(self):
+        with patch("mcp_email_server.scher_tools._pdf_to_png_pages", return_value=([], 0)):
+            with pytest.raises(ValueError, match="keine renderbaren"):
+                _render_attachment_to_images(b"%PDF-1.4", "application/pdf", "empty.pdf")
+
+
+class TestEncodeWithinBudget:
     def test_small_png_passes_through_unchanged(self):
         png = _make_image("PNG")
+        data, fmt = _encode_within_budget(png, 1_000_000)
         # under budget → returned as-is (identity, no re-encode)
-        assert _shrink_png_to_budget(png, 1_000_000) is png
+        assert data is png
+        assert fmt == "png"
 
-    def test_oversized_png_is_shrunk_under_budget(self):
+    def test_oversized_png_downscaled_under_budget_stays_png(self):
         big = _make_big_noise_png(1600)
         assert len(big) > 1_200_000  # sanity: original exceeds budget
-        out = _shrink_png_to_budget(big, 1_200_000)
-        assert len(out) <= 1_200_000
-        assert out.startswith(PNG_MAGIC)
-        assert len(out) < len(big)
+        data, fmt = _encode_within_budget(big, 1_200_000)
+        assert len(data) <= 1_200_000
+        assert fmt == "png"
+        assert data.startswith(PNG_MAGIC)
+        assert len(data) < len(big)
+
+    def test_falls_back_to_jpeg_when_png_cannot_fit_at_floor(self):
+        # Budget below what an incompressible image yields at the min edge → the
+        # PNG path can't satisfy it, so it MUST fall back to JPEG and still fit.
+        # This is the BUG codex flagged: the old code returned oversized PNG here.
+        big = _make_big_noise_png(1600)
+        data, fmt = _encode_within_budget(big, 200_000)
+        assert len(data) <= 200_000
+        assert fmt == "jpeg"
+        assert data.startswith(JPEG_MAGIC)
 
 
 class TestAttachmentImagesImpl:
@@ -174,6 +199,29 @@ class TestAttachmentImagesImpl:
             result = await _attachment_images_impl("scher", "9", "scan_no_ext", "INBOX", 10, 150)
 
         assert any(isinstance(x, Image) for x in result[1:])
+
+    @pytest.mark.asyncio
+    async def test_empty_attachment_raises(self):
+        async def fake_download(email_id, attachment_name, save_path, mailbox):
+            Path(save_path).write_bytes(b"")  # 0-byte file
+            return AttachmentDownloadResponse(
+                email_id=email_id,
+                attachment_name=attachment_name,
+                mime_type="application/pdf",
+                size=0,
+                saved_path=save_path,
+            )
+
+        handler = AsyncMock()
+        handler.download_attachment = AsyncMock(side_effect=fake_download)
+        enabled = SimpleNamespace(enable_attachment_download=True)
+
+        with (
+            patch("mcp_email_server.scher_tools.get_settings", return_value=enabled),
+            patch("mcp_email_server.scher_tools.dispatch_handler", return_value=handler),
+        ):
+            with pytest.raises(ValueError, match="leer"):
+                await _attachment_images_impl("scher", "4", "empty.pdf", "INBOX", 10, 150)
 
     @pytest.mark.asyncio
     async def test_gate_blocks_when_download_disabled(self):
