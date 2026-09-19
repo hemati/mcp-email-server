@@ -615,6 +615,64 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
     ):
         return await _attachment_images_impl(account_name, email_id, attachment_name, mailbox, max_pages, dpi)
 
+    @mcp.tool(
+        description=(
+            "Save an email as a DRAFT in the account's Drafts folder instead of sending it — for a human to "
+            "review and send from the mail client. Same message as send_email (threading, cc/bcc, html, "
+            "attachments from the server filesystem or inline base64), stored with \\Draft; nothing goes "
+            "over SMTP. The Drafts folder is found by its \\Drafts flag (IONOS: 'Entwürfe'). The test-mode "
+            "redirect does not apply: the draft keeps the real recipients."
+        )
+    )
+    async def save_draft(
+        account_name: Annotated[str, Field(min_length=1, description="The name of the email account.")],
+        recipients: Annotated[list[str], Field(description="A list of recipient email addresses.")],
+        subject: Annotated[str, Field(description="The subject of the email.")],
+        body: Annotated[str, Field(description="The body of the email.")],
+        cc: Annotated[list[str] | None, Field(default=None, description="CC addresses.")] = None,
+        bcc: Annotated[list[str] | None, Field(default=None, description="BCC addresses (kept in the draft).")] = None,
+        html: Annotated[bool, Field(default=False, description="HTML body (True) or plain text.")] = False,
+        attachments: Annotated[
+            list[str] | None, Field(default=None, description="Absolute file paths on the SERVER filesystem.")
+        ] = None,
+        attachments_inline: Annotated[
+            list[dict[str, str]] | None,
+            Field(default=None, description='Inline attachments: [{"filename": str, "content_base64": str}].'),
+        ] = None,
+        in_reply_to: Annotated[
+            str | None, Field(default=None, description="Message-ID of the email being replied to.")
+        ] = None,
+        references: Annotated[
+            str | None, Field(default=None, description="Space-separated Message-IDs of the thread.")
+        ] = None,
+        message_id: Annotated[
+            str | None, Field(default=None, description="Override the auto-generated Message-ID.")
+        ] = None,
+    ) -> str:
+        handler = dispatch_handler(account_name)
+        with tempfile.TemporaryDirectory(prefix="scher_draft_") as tmpdir:
+            files = list(attachments or [])
+            if attachments_inline:
+                files += materialize_inline_attachments(attachments_inline, tmpdir)
+            got = await handler.save_draft(
+                recipients=recipients,
+                subject=subject,
+                body=body,
+                cc=cc,
+                bcc=bcc,
+                html=html,
+                attachments=files or None,
+                in_reply_to=in_reply_to,
+                references=references,
+                message_id=message_id,
+            )
+        count = len(files)
+        with_files = f" with {count} attachment(s)" if count else ""
+        return (
+            f"Draft saved to '{got['folder']}'{with_files} for {', '.join(recipients)} "
+            f"(Message-Id {got['message_id']}) — not sent."
+        )
+
     logger.info(
-        "Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag, get_attachment_as_images"
+        "Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag, get_attachment_as_images, save_draft"
     )

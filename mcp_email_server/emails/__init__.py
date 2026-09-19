@@ -84,6 +84,10 @@ class EmailHandler(abc.ABC):
                 added if missing.
         """
 
+    async def save_draft(self, recipients: list[str], subject: str, body: str, **kwargs) -> dict[str, str]:
+        """Store the message as a draft instead of sending it (Scher v0.1.9; ClassicEmailHandler implements it)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot save drafts")
+
     @abc.abstractmethod
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """

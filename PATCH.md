@@ -204,14 +204,38 @@ ein TemporaryDirectory, hängt sie an und verwirft sie.
 
 **Upstream-PR-Kandidat:** ja — generisch nützlich für headless/remote-Clients.
 
+### 12. `save_draft` — Entwurf statt Versand (+ LIST-Parser-Fix)
+
+Hinzugefügt — **NEU** (v0.1.9). Anlass (2026-09-19): Eine Kundenmail sollte erst als
+Entwurf im Postfach liegen, damit Scher sie prüft und selbst abschickt — der MCP konnte
+nur senden.
+
+- Tool `save_draft` in `scher_tools.py`: dieselben Parameter wie `send_email` (inkl.
+  `attachments_inline`); baut dieselbe Nachricht und legt sie per IMAP APPEND mit
+  `(\Draft \Seen)` in den Entwürfe-Ordner. **Kein SMTP.** Der Test-Redirect
+  (`MCP_EMAIL_SERVER_REDIRECT_TO`) greift bewusst nicht: ein Entwurf wird nicht zugestellt,
+  er trägt die Adresse, an die der Mensch ihn später schickt. `bcc` bleibt als Header im Entwurf.
+- Entwürfe-Ordner: zuerst per `\Drafts`-Flag aus LIST (IONOS: `Entw&APw-rfe` = „Entwürfe"),
+  dann Kandidaten `Drafts`, `INBOX.Drafts`, `INBOX/Drafts`, `Entw&APw-rfe`, `[Gmail]/Drafts`.
+  Findet sich keiner → `RuntimeError`.
+- `classic.py`: `EmailClient.build_message()` aus `send_email` herausgezogen (Senden und Entwurf
+  bauen dieselbe Nachricht; der Redirect bleibt in `send_email`), `append_to_drafts()`,
+  `_find_folder_by_flag()`, `ClassicEmailHandler.save_draft()`.
+- **Bugfix `list_mailboxes`:** IONOS schickt Ordnernamen ohne Leerzeichen **ohne Anführungszeichen**
+  (`(\Drafts \HasNoChildren) "/" Entw&APw-rfe`). Der alte Parser splittete an `"` und nahm das
+  Trennzeichen „/" als Namen — `list_mailboxes` meldete alle Ordner außer „Gesendete Objekte" als „/".
+  Neuer Helper `_parse_list_line()` (quoted, unquoted, `NIL`-Delimiter, Escapes, ohne Flag-Klammer).
+
+**Upstream-PR-Kandidat:** ja, beides — der Parser-Fix ist ein echter Upstream-Bug.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
 
 | Datei                                 | Änderung                                                                                                                                                                                   | Grund             |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- |
-| `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` erweitert                                                                                      | Handler-Interface |
-| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
+| `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` erweitert; `save_draft` (nicht abstrakt, `NotImplementedError`)                                                                                      | Handler-Interface |
+| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`, `build_message` (aus `send_email` extrahiert), `append_to_drafts`, `_parse_list_line` (auch in `list_mailboxes`); `ClassicEmailHandler.save_draft`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
 | `mcp_email_server/emails/models.py`   | `EmailMetadata` (und damit transitiv `EmailBodyResponse`) bekommen optionale Felder `in_reply_to`, `references`; `from_email`-Classmethod propagiert sie                                  | Data shape        |
 | `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` + `attachments_inline` (base64) erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                  | Tool-Surface      |
 | `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `materialize_inline_attachments()` + `register_scher_tools()`-Funktion | Scher Extensions  |

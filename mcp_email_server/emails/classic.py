@@ -83,6 +83,31 @@ def _normalize_msgid(msgid: str) -> str:
     return s
 
 
+# (\Flag1 \Flag2) "/" "Name with space"  |  (\Drafts) "/" Entw&APw-rfe  |  (\Noselect) NIL name
+_LIST_LINE_RE = re.compile(r'^(?:\((?P<flags>[^)]*)\)\s+)?(?P<delim>NIL|"(?:[^"\\]|\\.)*")\s+(?P<name>.+?)\s*$')
+
+
+def _unquote_imap(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return re.sub(r"\\(.)", r"\1", value[1:-1])
+    return value
+
+
+def _parse_list_line(line: bytes | str) -> tuple[list[str], str | None, str] | None:
+    """Parse one IMAP LIST response line into (flags, delimiter, name); None if it is not one.
+
+    Scher patch (v0.1.9): the name may be unquoted — IONOS sends every name without a space
+    that way (``Entw&APw-rfe``, ``INBOX``). Splitting on double quotes then took the delimiter
+    ("/") for the name, so ``list_mailboxes`` reported every such folder as "/".
+    """
+    text = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+    match = _LIST_LINE_RE.match(text.strip())
+    if not match:
+        return None
+    delim = None if match["delim"] == "NIL" else _unquote_imap(match["delim"])
+    return (match["flags"] or "").split(), delim, _unquote_imap(match["name"])
+
+
 def _quote_mailbox(mailbox: str) -> str:
     """Quote mailbox name for IMAP compatibility.
 
@@ -876,7 +901,7 @@ class EmailClient:
 
         return msg
 
-    async def send_email(  # noqa: C901
+    async def send_email(
         self,
         recipients: list[str],
         subject: str,
@@ -919,6 +944,55 @@ class EmailClient:
             cc = None
             bcc = None
 
+        msg = self.build_message(recipients, subject, body, cc, html, attachments, in_reply_to, references, message_id)
+
+        # Preserve original visible recipients (To/Cc) on redirect, for audit.
+        # BCC is intentionally NOT preserved as a header: BCC stays hidden by
+        # design and writing X-Original-Bcc would leak addresses to the
+        # redirect inbox.
+        if redirect_to:
+            if original_to:
+                msg["X-Original-To"] = ", ".join(original_to)
+            if original_cc:
+                msg["X-Original-Cc"] = ", ".join(original_cc)
+
+        # Note: BCC recipients are not added to headers (they remain hidden)
+        # but will be included in the actual recipients for SMTP delivery
+
+        async with aiosmtplib.SMTP(
+            hostname=self.email_server.host,
+            port=self.email_server.port,
+            start_tls=self.smtp_start_tls,
+            use_tls=self.smtp_use_tls,
+            tls_context=self._get_smtp_ssl_context(),
+        ) as smtp:
+            await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
+
+            # Create a combined list of all recipients for delivery
+            all_recipients = recipients.copy()
+            if cc:
+                all_recipients.extend(cc)
+            if bcc:
+                all_recipients.extend(bcc)
+
+            await smtp.send_message(msg, recipients=all_recipients)
+
+        # Return the message for potential saving to Sent folder
+        return msg
+
+    def build_message(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        message_id: str | None = None,
+    ) -> MIMEText | MIMEMultipart:
+        """The message ``send_email`` sends and ``save_draft`` stores (Scher patch v0.1.9: extracted)."""
         # Create message with or without attachments
         if attachments:
             msg = self._create_message_with_attachments(body, html, attachments)
@@ -944,16 +1018,6 @@ class EmailClient:
         if cc:
             msg["Cc"] = ", ".join(cc)
 
-        # Preserve original visible recipients (To/Cc) on redirect, for audit.
-        # BCC is intentionally NOT preserved as a header: BCC stays hidden by
-        # design and writing X-Original-Bcc would leak addresses to the
-        # redirect inbox.
-        if redirect_to:
-            if original_to:
-                msg["X-Original-To"] = ", ".join(original_to)
-            if original_cc:
-                msg["X-Original-Cc"] = ", ".join(original_cc)
-
         # Set threading headers for replies
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
@@ -968,30 +1032,69 @@ class EmailClient:
         else:
             sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
             msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
-
-        # Note: BCC recipients are not added to headers (they remain hidden)
-        # but will be included in the actual recipients for SMTP delivery
-
-        async with aiosmtplib.SMTP(
-            hostname=self.email_server.host,
-            port=self.email_server.port,
-            start_tls=self.smtp_start_tls,
-            use_tls=self.smtp_use_tls,
-            tls_context=self._get_smtp_ssl_context(),
-        ) as smtp:
-            await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
-
-            # Create a combined list of all recipients for delivery
-            all_recipients = recipients.copy()
-            if cc:
-                all_recipients.extend(cc)
-            if bcc:
-                all_recipients.extend(bcc)
-
-            await smtp.send_message(msg, recipients=all_recipients)
-
-        # Return the message for potential saving to Sent folder
         return msg
+
+    async def _find_folder_by_flag(self, imap, flag: str) -> str | None:
+        """The folder whose LIST line carries a special-use flag (\\Sent, \\Drafts), or None."""
+        try:
+            _, folders = await imap.list('""', "*")
+            for folder in folders:
+                parsed = _parse_list_line(folder)
+                if parsed and flag in parsed[0]:
+                    logger.info(f"Found {flag} folder by flag: '{parsed[2]}'")
+                    return parsed[2]
+        except Exception as e:
+            logger.debug(f"Error finding {flag} folder by flag: {e}")
+        return None
+
+    async def append_to_drafts(
+        self,
+        msg: MIMEText | MIMEMultipart,
+        incoming_server: EmailServer,
+        drafts_folder_name: str | None = None,
+    ) -> str | None:
+        """Store a message as a draft (\\Draft) in the Drafts folder; returns the folder or None.
+
+        Scher patch (v0.1.9): the folder is found by its \\Drafts flag first (IONOS: ``Entw&APw-rfe``,
+        "Entwürfe" in modified UTF-7), then by common names.
+        """
+        imap = self._imap_connect_to(incoming_server)
+        candidates = [drafts_folder_name, "Drafts", "INBOX.Drafts", "INBOX/Drafts", "Entw&APw-rfe", "[Gmail]/Drafts"]
+        candidates = [f for f in candidates if f]
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(incoming_server.user_name, incoming_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            flagged = await self._find_folder_by_flag(imap, "\\Drafts")
+            if flagged:
+                candidates = [flagged] + [f for f in candidates if f != flagged]
+            for folder in candidates:
+                try:
+                    result = await imap.select(_quote_mailbox(folder))
+                    status = result[0] if isinstance(result, tuple) else result
+                    if str(status).upper() != "OK":
+                        continue
+                    appended = await imap.append(msg.as_bytes(), mailbox=_quote_mailbox(folder), flags=r"(\Draft \Seen)")
+                    append_status = appended[0] if isinstance(appended, tuple) else appended
+                    if str(append_status).upper() == "OK":
+                        logger.info(f"Saved draft to '{folder}'")
+                        return folder
+                    logger.warning(f"Failed to append draft to '{folder}': {append_status}")
+                except Exception as e:
+                    logger.debug(f"Drafts folder '{folder}' not available: {e}")
+            logger.warning("Could not find a Drafts folder that takes the message")
+            return None
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.debug(f"Error during logout: {e}")
+
+    def _imap_connect_to(self, server: EmailServer):
+        if server.use_ssl:
+            return aioimaplib.IMAP4_SSL(server.host, server.port, ssl_context=_create_ssl_context(server.verify_ssl))
+        return aioimaplib.IMAP4(server.host, server.port)
 
     async def _find_sent_folder_by_flag(self, imap) -> str | None:
         """Find the Sent folder by searching for the \\Sent IMAP flag.
@@ -1213,22 +1316,10 @@ class EmailClient:
             _, data = response
 
             for item in data:
-                if item == b"":
-                    continue
-                item_str = item.decode("utf-8") if isinstance(item, bytes) else str(item)
-                # IMAP LIST response format: (\Flag1 \Flag2) "delimiter" "name"
-                # Parse flags from parentheses
-                flags = []
-                if "(" in item_str and ")" in item_str:
-                    flags_str = item_str[item_str.index("(") + 1 : item_str.index(")")]
-                    flags = [f.strip() for f in flags_str.split() if f.strip()]
-
-                # Parse delimiter and name from quoted parts
-                parts = item_str.split('"')
-                if len(parts) >= 3:
-                    delimiter = parts[1]  # First quoted string is delimiter
-                    folder_name = parts[-2]  # Last quoted string is name
-                    mailboxes.append(MailboxInfo(name=folder_name, delimiter=delimiter, flags=flags))
+                parsed = _parse_list_line(item) if item else None
+                if parsed:
+                    flags, delimiter, folder_name = parsed
+                    mailboxes.append(MailboxInfo(name=folder_name, delimiter=delimiter or "", flags=flags))
         finally:
             try:
                 await imap.logout()
@@ -1483,6 +1574,34 @@ class ClassicEmailHandler(EmailHandler):
                 )
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
+
+    async def save_draft(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        message_id: str | None = None,
+    ) -> dict[str, str]:
+        """Build the message ``send_email`` would send and store it as a draft — no SMTP (Scher v0.1.9).
+
+        The test-mode redirect does not apply: a draft is not delivered, it carries the address the
+        human will send it to from the mail client.
+        """
+        msg = self.outgoing_client.build_message(
+            recipients, subject, body, cc, html, attachments, in_reply_to, references, message_id
+        )
+        if bcc:
+            msg["Bcc"] = ", ".join(bcc)  # kept in the draft: the mail client sends it, not SMTP here
+        folder = await self.outgoing_client.append_to_drafts(msg, self.email_settings.incoming)
+        if not folder:
+            raise RuntimeError("No Drafts folder accepted the message (looked for the \\Drafts flag and common names)")
+        return {"folder": folder, "message_id": msg["Message-Id"]}
 
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
