@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
@@ -883,12 +884,38 @@ class EmailClient:
         logger.info(f"Attached file: {path.name} ({mime_type})")
         return attachment_part
 
-    def _create_message_with_attachments(self, body: str, html: bool, attachments: list[str]) -> MIMEMultipart:
+    @staticmethod
+    def _create_related_part(body: str, inline_images: list[tuple[str, str, bytes]]) -> MIMEMultipart:
+        """HTML body plus the images it shows via ``<img src="cid:…">`` (Scher v0.1.10).
+
+        ``inline_images`` holds ``(cid, filename, data)``; the cid is written without angle brackets.
+        """
+        related = MIMEMultipart("related")
+        related.attach(MIMEText(body, "html", "utf-8"))
+        for cid, filename, data in inline_images:
+            mime_type, _ = mimetypes.guess_type(filename)
+            subtype = mime_type.split("/")[1] if mime_type and mime_type.startswith("image/") else "png"
+            image_part = MIMEImage(data, _subtype=subtype)
+            image_part.add_header("Content-ID", f"<{cid}>")
+            image_part.add_header("Content-Disposition", "inline", filename=filename)
+            related.attach(image_part)
+        return related
+
+    def _create_message_with_attachments(
+        self,
+        body: str,
+        html: bool,
+        attachments: list[str],
+        inline_images: list[tuple[str, str, bytes]] | None = None,
+    ) -> MIMEMultipart:
         """Create multipart message with attachments."""
         msg = MIMEMultipart()
-        content_type = "html" if html else "plain"
-        text_part = MIMEText(body, content_type, "utf-8")
-        msg.attach(text_part)
+        if inline_images:
+            msg.attach(self._create_related_part(body, inline_images))
+        else:
+            content_type = "html" if html else "plain"
+            text_part = MIMEText(body, content_type, "utf-8")
+            msg.attach(text_part)
 
         for file_path in attachments:
             try:
@@ -913,6 +940,7 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         message_id: str | None = None,
+        inline_images: list[tuple[str, str, bytes]] | None = None,
     ):
         # Apply MCP_EMAIL_SERVER_REDIRECT_TO test-mode redirection. When set,
         # ALL outgoing mail goes to this single address; the original
@@ -944,7 +972,9 @@ class EmailClient:
             cc = None
             bcc = None
 
-        msg = self.build_message(recipients, subject, body, cc, html, attachments, in_reply_to, references, message_id)
+        msg = self.build_message(
+            recipients, subject, body, cc, html, attachments, in_reply_to, references, message_id, inline_images
+        )
 
         # Preserve original visible recipients (To/Cc) on redirect, for audit.
         # BCC is intentionally NOT preserved as a header: BCC stays hidden by
@@ -991,11 +1021,20 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         message_id: str | None = None,
+        inline_images: list[tuple[str, str, bytes]] | None = None,
     ) -> MIMEText | MIMEMultipart:
-        """The message ``send_email`` sends and ``save_draft`` stores (Scher patch v0.1.9: extracted)."""
+        """The message ``send_email`` sends and ``save_draft`` stores (Scher patch v0.1.9: extracted).
+
+        ``inline_images`` (Scher v0.1.10) embeds images into an HTML body as ``multipart/related``.
+        """
+        if inline_images and not html:
+            msg = "inline_images need an HTML body (html=True) that references them as cid:"
+            raise ValueError(msg)
         # Create message with or without attachments
         if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
+            msg = self._create_message_with_attachments(body, html, attachments, inline_images)
+        elif inline_images:
+            msg = self._create_related_part(body, inline_images)
         else:
             content_type = "html" if html else "plain"
             msg = MIMEText(body, content_type, "utf-8")
@@ -1075,7 +1114,9 @@ class EmailClient:
                     status = result[0] if isinstance(result, tuple) else result
                     if str(status).upper() != "OK":
                         continue
-                    appended = await imap.append(msg.as_bytes(), mailbox=_quote_mailbox(folder), flags=r"(\Draft \Seen)")
+                    appended = await imap.append(
+                        msg.as_bytes(), mailbox=_quote_mailbox(folder), flags=r"(\Draft \Seen)"
+                    )
                     append_status = appended[0] if isinstance(appended, tuple) else appended
                     if str(append_status).upper() == "OK":
                         logger.info(f"Saved draft to '{folder}'")
@@ -1559,9 +1600,21 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         message_id: str | None = None,
+        inline_images: list[tuple[str, str, bytes]] | None = None,
     ) -> None:
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, message_id
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            message_id,
+            # only when used, so the call without images keeps upstream's shape
+            **({"inline_images": inline_images} if inline_images else {}),
         )
 
         # Save to Sent folder if enabled
@@ -1587,6 +1640,7 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         message_id: str | None = None,
+        inline_images: list[tuple[str, str, bytes]] | None = None,
     ) -> dict[str, str]:
         """Build the message ``send_email`` would send and store it as a draft — no SMTP (Scher v0.1.9).
 
@@ -1594,7 +1648,7 @@ class ClassicEmailHandler(EmailHandler):
         human will send it to from the mail client.
         """
         msg = self.outgoing_client.build_message(
-            recipients, subject, body, cc, html, attachments, in_reply_to, references, message_id
+            recipients, subject, body, cc, html, attachments, in_reply_to, references, message_id, inline_images
         )
         if bcc:
             msg["Bcc"] = ", ".join(bcc)  # kept in the draft: the mail client sends it, not SMTP here

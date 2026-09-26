@@ -228,19 +228,40 @@ nur senden.
 
 **Upstream-PR-Kandidat:** ja, beides — der Parser-Fix ist ein echter Upstream-Bug.
 
+### 13. `inline_images` — Bilder im HTML-Body (Logo in der Signatur)
+
+Hinzugefügt — **NEU** (v0.1.10). Anlass (2026-09-26): Das Büro hat eine neue HTML-Signatur mit
+Wappen-Logo und will sie in jeder Mail. Ein Bild erscheint im HTML-Body nur, wenn es im selben
+`multipart/related`-Teil mit einer `Content-ID` reist, auf die der Body per `<img src="cid:…">`
+zeigt. Ein normaler Anhang (auch `attachments_inline`) hat keine Content-ID; externe URLs blocken
+viele Clients.
+
+- `send_email` und `save_draft` bekommen `inline_images: [{cid, filename, content_base64}]`.
+  Verlangt `html=True`. PNG/JPEG/GIF, zusammen höchstens 2 MB dekodiert, cid ohne Leerzeichen,
+  keine doppelten cids (`decode_inline_images()` in `scher_tools.py`).
+- `classic.py`: `EmailClient._create_related_part()` baut `multipart/related` [text/html, image…]
+  mit `Content-ID: <cid>` und `Content-Disposition: inline`. Mit Anhängen liegt der related-Teil
+  als erster Teil in `multipart/mixed`. `build_message`, `send_email`, `ClassicEmailHandler.send_email`
+  und `save_draft` reichen den Parameter durch.
+- Ohne Bilder bleibt der Aufruf an den Handler exakt upstream-förmig (Parameter nur als Keyword,
+  wenn gesetzt) — die Upstream-Tests mit `assert_called_once_with` laufen unverändert.
+
+**Upstream-PR-Kandidat:** ja — HTML-Mails mit eingebetteten Bildern sind generisch.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
 
 | Datei                                 | Änderung                                                                                                                                                                                   | Grund             |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- |
-| `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` erweitert; `save_draft` (nicht abstrakt, `NotImplementedError`)                                                                                      | Handler-Interface |
-| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`, `build_message` (aus `send_email` extrahiert), `append_to_drafts`, `_parse_list_line` (auch in `list_mailboxes`); `ClassicEmailHandler.save_draft`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
+| `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` und `inline_images` erweitert; `save_draft` (nicht abstrakt, `NotImplementedError`)                                                                                      | Handler-Interface |
+| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`, `build_message` (aus `send_email` extrahiert), `append_to_drafts`, `_parse_list_line` (auch in `list_mailboxes`); `ClassicEmailHandler.save_draft`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `_create_related_part` + `inline_images` durch `build_message`/`send_email`/`save_draft`; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
 | `mcp_email_server/emails/models.py`   | `EmailMetadata` (und damit transitiv `EmailBodyResponse`) bekommen optionale Felder `in_reply_to`, `references`; `from_email`-Classmethod propagiert sie                                  | Data shape        |
-| `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` + `attachments_inline` (base64) erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                  | Tool-Surface      |
-| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `materialize_inline_attachments()` + `register_scher_tools()`-Funktion | Scher Extensions  |
+| `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` + `attachments_inline` (base64) + `inline_images` erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                  | Tool-Surface      |
+| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `materialize_inline_attachments()` + `decode_inline_images()` + `register_scher_tools()`-Funktion | Scher Extensions  |
 | `tests/test_scher_tools.py`           | **neue Datei** mit Mock-Tests für alle neuen Tools                                                                                                                                         | Testabdeckung     |
 | `tests/test_attachment_images.py`     | **neue Datei** mit Tests für `_render_attachment_to_images` + `_attachment_images_impl` (PDF/Bild/unsupported, Gate)                                                                       | Testabdeckung     |
+| `tests/test_inline_images.py`         | **neue Datei** mit Tests für `inline_images` (MIME-Aufbau, Validierung, Tool-Durchreichung, Entwurf)                                                                                       | Testabdeckung     |
 | `tests/test_send_email_extensions.py` | **neue Datei** mit Tests für `message_id` und `REDIRECT_TO`                                                                                                                                | Regression-Schutz |
 | `tests/test_email_client.py`          | Tests für `In-Reply-To`/`References`-Parsing in beiden Parse-Pfaden (`_parse_email_data`, `_parse_headers`)                                                                              | Regression-Schutz |
 | `tests/test_models.py`                | Tests für `EmailMetadata.from_email` mit/ohne Reply-Header                                                                                                                              | Regression-Schutz |

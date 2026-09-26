@@ -157,6 +157,17 @@ async def send_email(
             ),
         ),
     ] = None,
+    inline_images: Annotated[
+        list[dict[str, str]] | None,
+        Field(
+            default=None,
+            description=(
+                "Images shown inside the HTML body, e.g. a logo in the signature. Needs html=True; the body "
+                'references each one as <img src="cid:ID">. Each item: {"cid": str, "filename": str, '
+                '"content_base64": str}. PNG, JPEG or GIF, sent as multipart/related.'
+            ),
+        ),
+    ] = None,
     in_reply_to: Annotated[
         str | None,
         Field(
@@ -185,9 +196,10 @@ async def send_email(
     import contextlib
     import tempfile
 
-    from mcp_email_server.scher_tools import materialize_inline_attachments
+    from mcp_email_server.scher_tools import decode_inline_images, materialize_inline_attachments
 
     handler = dispatch_handler(account_name)
+    images = decode_inline_images(inline_images) if inline_images else None
     with contextlib.ExitStack() as stack:
         all_attachments = list(attachments or [])
         if attachments_inline:
@@ -204,6 +216,8 @@ async def send_email(
             in_reply_to,
             references,
             message_id,
+            # only when used, so the call without images keeps upstream's shape
+            **({"inline_images": images} if images else {}),
         )
     recipient_str = ", ".join(recipients)
     total_attachments = len(attachments or []) + len(attachments_inline or [])

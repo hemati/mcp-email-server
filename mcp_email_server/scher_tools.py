@@ -14,6 +14,7 @@ import asyncio
 import base64
 import binascii
 import os
+import re
 import socket
 import tempfile
 from pathlib import Path
@@ -345,10 +346,7 @@ async def _attachment_images_impl(
     """
     settings = get_settings()
     if not settings.enable_attachment_download:
-        msg = (
-            "Attachment access is disabled. Set 'enable_attachment_download=true' "
-            "in settings to enable this feature."
-        )
+        msg = "Attachment access is disabled. Set 'enable_attachment_download=true' in settings to enable this feature."
         raise PermissionError(msg)
 
     handler = dispatch_handler(account_name)
@@ -405,6 +403,50 @@ def materialize_inline_attachments(attachments_inline: list[dict], tmpdir: str) 
         Path(path).write_bytes(data)
         paths.append(path)
     return paths
+
+
+# --- Inline images (logo in an HTML signature) ---
+# A mail client shows an image inside the HTML body only when it travels in the same
+# multipart/related part with a Content-ID the body points at (<img src="cid:logo">).
+# A plain attachment, or an external URL, is blocked or shown below the text.
+
+_MAX_INLINE_IMAGE_BYTES = 2_000_000  # decoded total per request; a signature logo is a few KB
+_INLINE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif"}
+_CID_RE = re.compile(r"[A-Za-z0-9._@-]+")
+
+
+def decode_inline_images(inline_images: list[dict]) -> list[tuple[str, str, bytes]]:
+    """Decode ``[{"cid", "filename", "content_base64"}, ...]`` into ``(cid, filename, data)``.
+
+    The cid may come with or without angle brackets. Raises ``ValueError`` on a missing or
+    malformed cid, a duplicate cid, a non-image filename, invalid or empty base64, or when the
+    decoded total exceeds ``_MAX_INLINE_IMAGE_BYTES``.
+    """
+    images: list[tuple[str, str, bytes]] = []
+    seen: set[str] = set()
+    total = 0
+    for index, item in enumerate(inline_images):
+        item = item or {}
+        cid = str(item.get("cid") or "").strip().strip("<>")
+        if not _CID_RE.fullmatch(cid):
+            raise ValueError(f"Inline-Bild {index + 1}: cid {cid!r} fehlt oder enthält unzulässige Zeichen.")
+        if cid in seen:
+            raise ValueError(f"Inline-Bild {index + 1}: cid {cid!r} kommt doppelt vor.")
+        seen.add(cid)
+        filename = os.path.basename(str(item.get("filename") or "").strip()) or f"{cid}.png"
+        if os.path.splitext(filename)[1].lower() not in _INLINE_IMAGE_EXTENSIONS:
+            raise ValueError(f"Inline-Bild {filename!r}: nur PNG, JPEG oder GIF.")
+        try:
+            data = base64.b64decode(item.get("content_base64") or "", validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"Inline-Bild {filename!r}: ungültiges base64 ({e}).") from e
+        if not data:
+            raise ValueError(f"Inline-Bild {filename!r}: leer nach base64-Dekodierung.")
+        total += len(data)
+        if total > _MAX_INLINE_IMAGE_BYTES:
+            raise ValueError(f"Inline-Bilder überschreiten {_MAX_INLINE_IMAGE_BYTES} Bytes (dekodiert).")
+        images.append((cid, filename, data))
+    return images
 
 
 def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
@@ -639,6 +681,16 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
             list[dict[str, str]] | None,
             Field(default=None, description='Inline attachments: [{"filename": str, "content_base64": str}].'),
         ] = None,
+        inline_images: Annotated[
+            list[dict[str, str]] | None,
+            Field(
+                default=None,
+                description=(
+                    'Images shown inside the HTML body (html=True) via <img src="cid:ID">: '
+                    '[{"cid": str, "filename": str, "content_base64": str}].'
+                ),
+            ),
+        ] = None,
         in_reply_to: Annotated[
             str | None, Field(default=None, description="Message-ID of the email being replied to.")
         ] = None,
@@ -665,6 +717,7 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
                 in_reply_to=in_reply_to,
                 references=references,
                 message_id=message_id,
+                inline_images=decode_inline_images(inline_images) if inline_images else None,
             )
         count = len(files)
         with_files = f" with {count} attachment(s)" if count else ""

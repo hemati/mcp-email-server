@@ -65,6 +65,7 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         message_id: str | None = None,
+        inline_images: list[tuple[str, str, bytes]] | None = None,
     ) -> None:
         """
         Send email
@@ -82,6 +83,8 @@ class EmailHandler(abc.ABC):
             message_id: Override the auto-generated Message-ID header. If None,
                 a Message-ID is generated automatically. ``<...>`` brackets are
                 added if missing.
+            inline_images: ``(cid, filename, data)`` images embedded in an HTML body
+                (Scher v0.1.10); the body shows them via ``<img src="cid:…">``.
         """
 
     async def save_draft(self, recipients: list[str], subject: str, body: str, **kwargs) -> dict[str, str]:
