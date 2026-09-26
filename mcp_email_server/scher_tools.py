@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import heapq
 import os
 import re
 import socket
@@ -449,6 +450,159 @@ def decode_inline_images(inline_images: list[dict]) -> list[tuple[str, str, byte
     return images
 
 
+# ---------------------------------------------------------------------------
+# mailbox_usage — what fills the IMAP quota (read-only)
+# ---------------------------------------------------------------------------
+# A full mailbox fails quietly: IONOS answers COPY/APPEND with [OVERQUOTA] and rejects
+# incoming mail, but nothing in the other tools shows how full it is or which folder
+# is to blame. GETQUOTAROOT gives used/limit, UID FETCH (RFC822.SIZE) the per-message
+# sizes. Nothing gets flagged, moved or deleted.
+
+_STORAGE_QUOTA_RE = re.compile(rb"STORAGE\s+(\d+)\s+(\d+)", re.IGNORECASE)
+_FETCH_UID_RE = re.compile(rb"\bUID\s+(\d+)")
+_FETCH_SIZE_RE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)")
+_EXISTS_RE = re.compile(rb"^(\d+)\s+EXISTS\b", re.IGNORECASE)
+
+
+def _as_bytes(line: Any) -> bytes | None:
+    if isinstance(line, (bytes, bytearray)):
+        return bytes(line)
+    if isinstance(line, str):
+        return line.encode()
+    return None
+
+
+def _parse_storage_quota(lines: list) -> dict[str, Any] | None:
+    """Pick the STORAGE resource out of a GETQUOTAROOT reply; RFC 2087 counts it in units of 1024 octets."""
+    for line in lines:
+        raw = _as_bytes(line)
+        match = _STORAGE_QUOTA_RE.search(raw) if raw else None
+        if match:
+            used, limit = (int(value) * 1024 for value in match.groups())
+            percent = round(used * 100 / limit, 1) if limit else None
+            return {"used_bytes": used, "limit_bytes": limit, "used_percent": percent}
+    return None
+
+
+def _parse_fetch_sizes(lines: list) -> list[tuple[str, int]]:
+    """``(uid, size)`` pairs from a ``UID FETCH (RFC822.SIZE)`` reply; servers order UID and SIZE either way."""
+    sizes: list[tuple[str, int]] = []
+    for line in lines:
+        raw = _as_bytes(line)
+        if not raw or b"FETCH" not in raw:
+            continue
+        uid, size = _FETCH_UID_RE.search(raw), _FETCH_SIZE_RE.search(raw)
+        if uid and size:
+            sizes.append((uid.group(1).decode(), int(size.group(1))))
+    return sizes
+
+
+async def _folder_usage(client: Any, imap: Any, name: str, top: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Message count and bytes of one folder, plus its ``top`` largest messages with their headers."""
+    from mcp_email_server.emails.classic import _quote_mailbox, _raise_for_imap_error
+
+    # SELECT, not EXAMINE: aioimaplib only enters the SELECTED state on select(), and UID FETCH
+    # refuses to run outside it. Nothing below sets a flag (RFC822.SIZE, BODY.PEEK).
+    reply = await imap.select(_quote_mailbox(name))
+    _raise_for_imap_error(reply, f"SELECT {name}")
+    exists = None
+    for line in reply[1]:
+        raw = _as_bytes(line)
+        match = _EXISTS_RE.match(raw) if raw else None
+        if match:
+            exists = int(match.group(1))
+    if exists == 0:
+        # Some servers answer UID FETCH 1:* on an empty folder with NO.
+        return {"mailbox": name, "messages": 0, "bytes": 0}, []
+
+    reply = await imap.uid("fetch", "1:*", "(RFC822.SIZE)")
+    _raise_for_imap_error(reply, f"UID FETCH sizes in {name}")
+    sizes = _parse_fetch_sizes(reply[1])
+    folder = {"mailbox": name, "messages": len(sizes), "bytes": sum(size for _, size in sizes)}
+    if not top:
+        return folder, []
+
+    biggest = heapq.nlargest(top, sizes, key=lambda pair: pair[1])
+    try:
+        headers = await client._batch_fetch_headers(imap, [uid for uid, _ in biggest])
+    except Exception as e:
+        # Subjects are a convenience; the sizes above are the answer and must survive.
+        logger.warning(f"mailbox_usage: headers of the largest messages in {name} unavailable: {e}")
+        headers = {}
+    largest = []
+    for uid, size in biggest:
+        meta = headers.get(uid, {})
+        date = meta.get("date")
+        largest.append({
+            "mailbox": name,
+            "email_id": uid,
+            "bytes": size,
+            "subject": meta.get("subject", ""),
+            "from": meta.get("from", ""),
+            "date": date.isoformat() if hasattr(date, "isoformat") else date,
+        })
+    return folder, largest
+
+
+async def _mailbox_usage_impl(client: Any, mailboxes: list[str] | None, top: int) -> dict[str, Any]:
+    """Quota, per-folder totals (largest first) and the ``top`` largest messages across the measured folders.
+
+    A folder that cannot be opened is listed with its error after the measured ones; it does not stop the rest.
+    """
+    from mcp_email_server.emails.classic import _imap_status, _parse_list_line, _raise_for_imap_error, _send_imap_id
+
+    imap = client._imap_connect()
+    try:
+        await imap._client_task
+        await imap.wait_hello_from_server()
+        await imap.login(client.email_server.user_name, client.email_server.password.get_secret_value())
+        await _send_imap_id(imap)
+
+        result: dict[str, Any] = {"quota": None}
+        try:
+            reply = await imap.getquotaroot("INBOX")
+            if _imap_status(reply) == "OK":
+                result["quota"] = _parse_storage_quota(reply[1])
+            else:
+                result["quota_error"] = f"GETQUOTAROOT: {reply!r}"
+        except Exception as e:
+            result["quota_error"] = f"GETQUOTAROOT: {e}"
+
+        if mailboxes is None:
+            reply = await imap.list('""', "*")
+            _raise_for_imap_error(reply, "LIST mailboxes")
+            names = []
+            for line in reply[1]:
+                parsed = _parse_list_line(line) if line else None
+                if parsed and "\\noselect" not in {flag.lower() for flag in parsed[0]}:
+                    names.append(parsed[2])
+        else:
+            names = list(mailboxes)
+
+        folders: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        for name in names:
+            try:
+                folder, largest = await _folder_usage(client, imap, name, top)
+            except Exception as e:
+                failed.append({"mailbox": name, "error": str(e)})
+                continue
+            folders.append(folder)
+            candidates += largest
+
+        folders.sort(key=lambda folder: folder["bytes"], reverse=True)
+        result["total_bytes"] = sum(folder["bytes"] for folder in folders)
+        result["folders"] = folders + failed
+        result["largest"] = heapq.nlargest(top, candidates, key=lambda message: message["bytes"]) if top else []
+        return result
+    finally:
+        try:
+            await imap.logout()
+        except Exception as e:
+            logger.info(f"Error during logout: {e}")
+
+
 def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
     """Register Scher Extensions on an existing FastMCP server.
 
@@ -726,6 +880,31 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
             f"(Message-Id {got['message_id']}) — not sent."
         )
 
+    @mcp.tool(
+        description=(
+            "Show what fills the mailbox: the IMAP quota (used/limit in bytes via GETQUOTAROOT), message count "
+            "and total size per folder (largest first), and the biggest messages with subject, sender and date. "
+            "Read-only: sizes and headers are fetched with PEEK, nothing is flagged, moved or deleted. Use it when the "
+            "server answers [OVERQUOTA] or incoming mail stops."
+        )
+    )
+    async def mailbox_usage(
+        account_name: Annotated[str, Field(min_length=1, description="The name of the email account.")],
+        mailboxes: Annotated[
+            list[str] | None,
+            Field(default=None, description="Folders to measure; all selectable folders when omitted."),
+        ] = None,
+        top: Annotated[
+            int, Field(default=10, ge=0, le=50, description="How many of the largest messages to list.")
+        ] = 10,
+    ) -> dict[str, Any]:
+        handler = dispatch_handler(account_name)
+        client = getattr(handler, "incoming_client", None)
+        if client is None:
+            raise ValueError(f"mailbox_usage braucht ein IMAP-Konto; {account_name!r} hat keins.")
+        return await _mailbox_usage_impl(client, mailboxes, top)
+
     logger.info(
-        "Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag, get_attachment_as_images, save_draft"
+        "Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag, get_attachment_as_images, "
+        "save_draft, mailbox_usage"
     )

@@ -253,6 +253,29 @@ viele Clients.
 
 **Upstream-PR-Kandidat:** ja — HTML-Mails mit eingebetteten Bildern sind generisch.
 
+### 14. `mailbox_usage` — was das Postfach füllt
+
+Hinzugefügt — **NEU** (v0.1.11). Anlass (2026-09-26): Das Scher-Postfach war voll. IONOS lehnte
+COPY und APPEND mit `[OVERQUOTA] quota exceeded` ab (Papierkorb-Verschieben und die Kopie in
+„Gesendete Objekte“ scheiterten), und seit dem Vorabend kam keine Mail mehr an. Welcher Ordner den
+Platz belegt, ließ sich mit keinem Tool feststellen.
+
+- Neues Tool `mailbox_usage(account_name, mailboxes=None, top=10)` in `scher_tools.py`, kein
+  Upstream-Code angefasst. Liefert die Quota aus `GETQUOTAROOT` (STORAGE, RFC 2087 in KiB → Bytes,
+  plus Prozent), je Ordner Anzahl und Bytes aus `UID FETCH 1:* (RFC822.SIZE)` (größter Ordner
+  zuerst) und die `top` größten Mails mit Betreff, Absender und Datum.
+- Liest nur: `SELECT`, `RFC822.SIZE`, `BODY.PEEK[HEADER]` setzen keine Flags. **Nicht `EXAMINE`:**
+  aioimaplib wechselt nur bei `select()` in den Zustand SELECTED, `UID FETCH` nach `examine()`
+  bricht mit „illegal in state AUTH“ ab.
+- Ordner mit `\Noselect` werden übersprungen, ein Ordner, der sich nicht öffnen lässt, steht mit
+  `error` hinten in der Liste und hält die übrigen nicht auf. Scheitert nur der Abruf der Betreffs,
+  bleiben die Größen stehen (Betreff dann leer). Ein leerer Ordner (`0 EXISTS`) wird nicht gefetcht.
+- Geprüft mit Mocks (`tests/test_mailbox_usage.py`) und einmal gegen aioimaplibs
+  `imap_testing_server` (echtes Protokoll). Der Test-Server kennt `RFC822.SIZE` nicht und entfernt
+  keine Anführungszeichen um Ordnernamen — für den Lauf gepatcht, deshalb kein Dauertest daraus.
+
+**Upstream-PR-Kandidat:** ja — Quota- und Ordnergrößen sind generisch.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
