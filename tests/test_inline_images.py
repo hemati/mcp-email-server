@@ -7,6 +7,8 @@ example.com / fake credentials and a 1x1 PNG throughout.
 
 import base64
 import email
+import email.header
+import email.utils
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -43,6 +45,7 @@ class TestBuildMessage:
             )
         )
         assert msg.get_content_type() == "multipart/related"
+        assert msg.get_param("type") == "text/html"  # RFC 2387
         html_part, image_part = msg.get_payload()
         assert html_part.get_content_type() == "text/html"
         assert "cid:logo" in html_part.get_payload(decode=True).decode()
@@ -185,3 +188,14 @@ class TestTools:
         msg = _parse(handler.outgoing_client.append_to_drafts.call_args.args[0])
         assert msg.get_content_type() == "multipart/related"
         assert msg.get_payload()[1]["Content-ID"] == "<logo>"
+
+
+def test_umlaut_sender_keeps_the_address_readable():
+    """Only the display name is encoded; the address stays plain so servers and clients can read it."""
+    server = EmailServer(user_name="u", password="p", host="smtp.example.com", port=465, use_ssl=True)
+    client = EmailClient(server, sender="Übersetzungsbüro SCHER <info@example.com>")
+    msg = email.message_from_bytes(client.build_message(["a@example.com"], "S", "text").as_bytes())
+    raw = msg["From"]
+    assert raw.endswith("<info@example.com>")
+    name, address = email.utils.parseaddr(str(email.header.make_header(email.header.decode_header(raw))))
+    assert (name, address) == ("Übersetzungsbüro SCHER", "info@example.com")

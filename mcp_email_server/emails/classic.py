@@ -890,7 +890,7 @@ class EmailClient:
 
         ``inline_images`` holds ``(cid, filename, data)``; the cid is written without angle brackets.
         """
-        related = MIMEMultipart("related")
+        related = MIMEMultipart("related", type="text/html")
         related.attach(MIMEText(body, "html", "utf-8"))
         for cid, filename, data in inline_images:
             mime_type, _ = mimetypes.guess_type(filename)
@@ -1045,9 +1045,13 @@ class EmailClient:
         else:
             msg["Subject"] = subject
 
-        # Handle sender name with special characters
+        # Handle sender name with special characters. Only the display name gets encoded (Scher v0.1.10):
+        # encoding "Name <addr>" as one encoded word hides the address and breaks the From header.
         if any(ord(c) > 127 for c in self.sender):
-            msg["From"] = Header(self.sender, "utf-8")
+            name, address = email.utils.parseaddr(self.sender)
+            msg["From"] = (
+                email.utils.formataddr((name, address), charset="utf-8") if address else Header(self.sender, "utf-8")
+            )
         else:
             msg["From"] = self.sender
 

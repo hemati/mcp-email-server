@@ -243,6 +243,11 @@ viele Clients.
   mit `Content-ID: <cid>` und `Content-Disposition: inline`. Mit Anhängen liegt der related-Teil
   als erster Teil in `multipart/mixed`. `build_message`, `send_email`, `ClassicEmailHandler.send_email`
   und `save_draft` reichen den Parameter durch.
+- `multipart/related` trägt `type="text/html"` (RFC 2387). Als cid eine Adresse mit `@` nehmen
+  (z. B. `scher-wappen@scher-frankfurt.de`), das ist gültige Content-ID-Syntax.
+- **Bugfix From-Header:** Bei einem Absendernamen mit Umlaut (`Übersetzungsbüro SCHER <info@…>`)
+  kodierte `build_message` den ganzen String als ein Encoded Word; die Adresse war darin versteckt.
+  Jetzt wird nur der Anzeigename kodiert (`email.utils.formataddr(…, charset="utf-8")`).
 - Ohne Bilder bleibt der Aufruf an den Handler exakt upstream-förmig (Parameter nur als Keyword,
   wenn gesetzt) — die Upstream-Tests mit `assert_called_once_with` laufen unverändert.
 
