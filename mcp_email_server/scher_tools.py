@@ -13,11 +13,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
+import email
 import heapq
+import io
 import os
 import re
 import socket
 import tempfile
+from datetime import date
+from email.generator import BytesGenerator
+from email.header import decode_header, make_header
+from email.mime.text import MIMEText
+from email.parser import BytesHeaderParser
+from email.policy import compat32
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -603,6 +612,184 @@ async def _mailbox_usage_impl(client: Any, mailboxes: list[str] | None, top: int
             logger.info(f"Error during logout: {e}")
 
 
+# ---------------------------------------------------------------------------
+# strip_attachments — drop large attachments, keep the mail
+# ---------------------------------------------------------------------------
+# IMAP cannot edit a stored message. The copy without the attachments is APPENDed first,
+# with the original flags and INTERNALDATE; only once the server has accepted it is the
+# original deleted, by UID EXPUNGE so other \Deleted mails in the folder are left alone.
+# compat32 keeps the untouched headers and parts byte-for-byte (Message-ID stays, so
+# replies still thread and parse-translator-reply still matches).
+
+_FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
+_INTERNALDATE_RE = re.compile(rb'INTERNALDATE ("[^"]+")')
+_APPENDUID_RE = re.compile(rb"APPENDUID\s+\d+\s+(\d+)")
+_UNSETTABLE_FLAGS = {"\\recent", "\\deleted"}
+_REMOVED_HEADER = "X-Scher-Attachments-Removed"
+
+
+def _decode_header_text(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(str(value))))
+    except Exception:
+        return str(value)
+
+
+def _removal_note(info: dict[str, Any], today: date) -> MIMEText:
+    megabytes = f"{info['bytes'] / 1_000_000:.1f}".replace(".", ",")
+    return MIMEText(
+        f"Anhang entfernt am {today:%d.%m.%Y}, um Platz im Postfach zu schaffen: "
+        f"{info['filename']} ({megabytes} MB, {info['content_type']}).\r\n",
+        "plain",
+        "utf-8",
+    )
+
+
+def strip_large_parts(raw: bytes, min_bytes: int, today: date) -> tuple[bytes, list[dict[str, Any]]]:
+    """Replace every attachment of at least ``min_bytes`` (encoded) by a short text note.
+
+    Kept: message bodies (text/plain, text/html without a file name), inline parts with a
+    Content-ID (a signature logo), everything smaller than ``min_bytes``. Returns the raw
+    bytes unchanged when nothing qualifies; otherwise the rebuilt message with CRLF line
+    endings and an ``X-Scher-Attachments-Removed`` header, plus what was removed.
+    """
+    msg = email.message_from_bytes(raw, policy=compat32)
+    removed: list[dict[str, Any]] = []
+
+    def visit(container: Any) -> None:
+        payload = container.get_payload()
+        if not isinstance(payload, list):
+            return
+        for index, child in enumerate(payload):
+            if child.get_content_maintype() == "multipart":
+                visit(child)
+                continue
+            if child.get_content_type() in ("text/plain", "text/html") and not child.get_filename():
+                continue
+            if child.get_content_disposition() == "inline" and child["Content-ID"]:
+                continue
+            size = len(child.as_bytes())
+            if size < min_bytes:
+                continue
+            info = {
+                "filename": _decode_header_text(child.get_filename() or child.get_param("name")) or "(ohne Namen)",
+                "content_type": child.get_content_type(),
+                "bytes": size,
+            }
+            payload[index] = _removal_note(info, today)
+            removed.append(info)
+
+    if msg.get_content_maintype() == "multipart":
+        visit(msg)
+    if not removed:
+        return raw, []
+
+    total = sum(info["bytes"] for info in removed)
+    msg[_REMOVED_HEADER] = f"{today.isoformat()}; {len(removed)} Datei(en), {total} Bytes"
+    buffer = io.BytesIO()
+    BytesGenerator(buffer, mangle_from_=False, maxheaderlen=0, policy=compat32.clone(linesep="\r\n")).flatten(msg)
+    return buffer.getvalue(), removed
+
+
+async def _strip_one(imap: Any, mailbox: str, uid: str, min_bytes: int, dry_run: bool, today: date) -> dict[str, Any]:
+    from mcp_email_server.emails.classic import _quote_mailbox, _raise_for_imap_error
+
+    reply = await imap.uid("fetch", uid, "(UID FLAGS INTERNALDATE BODY.PEEK[])")
+    _raise_for_imap_error(reply, f"UID FETCH {uid}")
+    raw = next((bytes(line) for line in reply[1] if isinstance(line, bytearray)), None)
+    if raw is None:
+        raise RuntimeError(f"Mail {uid} gibt es in {mailbox} nicht.")
+    meta = b" ".join(line for line in reply[1] if isinstance(line, bytes))
+    flags_match = _FLAGS_RE.search(meta)
+    flags = [
+        flag
+        for flag in (flags_match.group(1).decode().split() if flags_match else [])
+        if flag.lower() not in _UNSETTABLE_FLAGS
+    ]
+    date_match = _INTERNALDATE_RE.search(meta)
+
+    stripped, removed = strip_large_parts(raw, min_bytes, today)
+    entry: dict[str, Any] = {
+        "email_id": uid,
+        "subject": _decode_header_text(BytesHeaderParser(policy=compat32).parsebytes(raw)["Subject"]),
+        "old_bytes": len(raw),
+        "new_bytes": len(stripped),
+        "removed": removed,
+    }
+    if not removed:
+        entry["status"] = "nothing_to_strip"
+        return entry
+    if dry_run:
+        entry["status"] = "would_strip"
+        return entry
+
+    appended = await imap.append(
+        stripped,
+        mailbox=_quote_mailbox(mailbox),
+        flags=f"({' '.join(flags)})" if flags else None,
+        date=date_match.group(1).decode() if date_match else None,
+    )
+    _raise_for_imap_error(appended, f"APPEND der Kopie ohne Anhang von {uid}")
+    appenduid = _APPENDUID_RE.search(b" ".join(_as_bytes(line) or b"" for line in appended[1]))
+    entry["new_email_id"] = appenduid.group(1).decode() if appenduid else None
+    try:
+        _raise_for_imap_error(await imap.uid("store", uid, "+FLAGS", "(\\Deleted)"), f"STORE \\Deleted {uid}")
+        _raise_for_imap_error(await imap.uid("expunge", uid), f"UID EXPUNGE {uid}")
+    except Exception as e:
+        entry["status"] = "error"
+        entry["error"] = f"Kopie ohne Anhang liegt schon in {mailbox}, das Original aber auch noch: {e}"
+        return entry
+    entry["status"] = "stripped"
+    return entry
+
+
+async def _strip_attachments_impl(
+    client: Any, mailbox: str, email_ids: list[str], min_bytes: int, dry_run: bool, today: date | None = None
+) -> dict[str, Any]:
+    """Strip large attachments from ``email_ids`` in ``mailbox``; one failing mail does not stop the rest."""
+    from mcp_email_server.emails.classic import _quote_mailbox, _raise_for_imap_error, _send_imap_id
+
+    today = today or date.today()
+    imap = client._imap_connect()
+    try:
+        await imap._client_task
+        await imap.wait_hello_from_server()
+        await imap.login(client.email_server.user_name, client.email_server.password.get_secret_value())
+        await _send_imap_id(imap)
+        if not dry_run and not imap.has_capability("UIDPLUS"):
+            with contextlib.suppress(Exception):
+                await imap.protocol.capability()
+            if not imap.has_capability("UIDPLUS"):
+                msg = "Der Server kann kein UID EXPUNGE (UIDPLUS fehlt); ohne das würde EXPUNGE alle gelöschten Mails im Ordner entfernen."
+                raise RuntimeError(msg)
+        _raise_for_imap_error(await imap.select(_quote_mailbox(mailbox)), f"SELECT {mailbox}")
+
+        messages: list[dict[str, Any]] = []
+        for uid in email_ids:
+            try:
+                messages.append(await _strip_one(imap, mailbox, uid, min_bytes, dry_run, today))
+            except Exception as e:
+                messages.append({"email_id": uid, "status": "error", "error": str(e)})
+
+        def saved(status: str) -> int:
+            return sum(m["old_bytes"] - m["new_bytes"] for m in messages if m["status"] == status)
+
+        return {
+            "mailbox": mailbox,
+            "dry_run": dry_run,
+            "freed_bytes": saved("stripped"),
+            "would_free_bytes": saved("would_strip"),
+            "messages": messages,
+        }
+    finally:
+        try:
+            await imap.logout()
+        except Exception as e:
+            logger.info(f"Error during logout: {e}")
+
+
 def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
     """Register Scher Extensions on an existing FastMCP server.
 
@@ -904,7 +1091,34 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
             raise ValueError(f"mailbox_usage braucht ein IMAP-Konto; {account_name!r} hat keins.")
         return await _mailbox_usage_impl(client, mailboxes, top)
 
+    @mcp.tool(
+        description=(
+            "Remove large attachments from stored emails but keep the emails: every attachment of at least "
+            "min_bytes is replaced by a short note (file name, size, date of removal). Text, recipients, date, "
+            "flags, Message-ID and inline images such as a signature logo stay. dry_run=True (default) changes "
+            "nothing and reports what would be removed and how much space it frees. A real run APPENDs the copy "
+            "without attachments first and only then deletes the original by UID EXPUNGE (server needs UIDPLUS). "
+            "The removed files are gone for good; the email_id changes (new_email_id). Up to 20 emails per call."
+        )
+    )
+    async def strip_attachments(
+        account_name: Annotated[str, Field(min_length=1, description="The name of the email account.")],
+        mailbox: Annotated[str, Field(min_length=1, description="The folder holding the emails.")],
+        email_ids: Annotated[
+            list[str], Field(min_length=1, max_length=20, description="email_id (UID) of each email to strip.")
+        ],
+        min_bytes: Annotated[
+            int, Field(default=1_000_000, ge=100_000, description="Only attachments at least this large (encoded).")
+        ] = 1_000_000,
+        dry_run: Annotated[bool, Field(default=True, description="True: only report, change nothing.")] = True,
+    ) -> dict[str, Any]:
+        handler = dispatch_handler(account_name)
+        client = getattr(handler, "incoming_client", None)
+        if client is None:
+            raise ValueError(f"strip_attachments braucht ein IMAP-Konto; {account_name!r} hat keins.")
+        return await _strip_attachments_impl(client, mailbox, email_ids, min_bytes, dry_run)
+
     logger.info(
         "Scher Extensions registered: mark_seen, mark_unseen, ensure_folder, diag, get_attachment_as_images, "
-        "save_draft, mailbox_usage"
+        "save_draft, mailbox_usage, strip_attachments"
     )

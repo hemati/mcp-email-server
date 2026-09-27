@@ -276,6 +276,33 @@ Platz belegt, ließ sich mit keinem Tool feststellen.
 
 **Upstream-PR-Kandidat:** ja — Quota- und Ordnergrößen sind generisch.
 
+### 15. `strip_attachments` — große Anhänge weg, Mail bleibt
+
+Hinzugefügt — **NEU** (v0.1.12). Anlass (2026-09-27): `mailbox_usage` zeigte 1,54 GB in
+„Gesendete Objekte“, fast alles Ausschreibungen, bei denen derselbe Scan an jeden Dolmetscher
+einzeln ging (26011: 9 Kopien à 25 MB). Die Mails sollen als Nachweis bleiben, nur die Dateien weg.
+
+- Neues Tool `strip_attachments(account_name, mailbox, email_ids, min_bytes=1_000_000, dry_run=True)`
+  in `scher_tools.py`, höchstens 20 Mails je Aufruf, kein Upstream-Code angefasst.
+- IMAP kann eine gespeicherte Mail nicht ändern. Ablauf je Mail: `UID FETCH (UID FLAGS INTERNALDATE
+  BODY.PEEK[])` → `strip_large_parts()` ersetzt jeden Teil ab `min_bytes` (kodierte Größe) durch einen
+  Text-Vermerk („Anhang entfernt am …: Datei (x MB, Typ)“) und setzt `X-Scher-Attachments-Removed` →
+  **erst** `APPEND` der Kopie mit den alten Flags (ohne `\Recent`/`\Deleted`) und dem alten
+  INTERNALDATE → **dann** `UID STORE +FLAGS (\Deleted)` + `UID EXPUNGE <uid>`.
+- **`UID EXPUNGE` statt `EXPUNGE`:** ein nacktes EXPUNGE würde alle als gelöscht markierten Mails im
+  Ordner mitnehmen. Ohne UIDPLUS verweigert das Tool den echten Lauf.
+- Bleibt: Text/HTML-Body ohne Dateinamen, Inline-Teile mit Content-ID (Wappen in der Signatur),
+  alles unter `min_bytes`, alle übrigen Header byte-genau (compat32 + `BytesGenerator(maxheaderlen=0)`,
+  CRLF). Die Message-ID bleibt, Antworten ordnen sich also weiter zu; die UID ändert sich
+  (`new_email_id` aus `APPENDUID`).
+- Scheitert APPEND (z. B. `[OVERQUOTA]`), bleibt das Original unberührt. Scheitert nach dem APPEND
+  das Löschen, meldet das Tool, dass beide Fassungen im Ordner liegen.
+- Geprüft mit Mocks (`tests/test_strip_attachments.py`) und gegen aioimaplibs `imap_testing_server`
+  (gepatcht: UIDPLUS in CAPABILITY, Ordnernamen ohne Leerzeichen, weil der Test-Server Argumente an
+  Leerzeichen trennt): Probelauf ändert nichts, echter Lauf 3,4 MB → 860 Bytes, Message-ID gleich.
+
+**Upstream-PR-Kandidat:** eher nein — der deutsche Vermerk ist Scher-spezifisch; die Mechanik wäre generisch.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
