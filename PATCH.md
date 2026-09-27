@@ -303,6 +303,52 @@ einzeln ging (26011: 9 Kopien à 25 MB). Die Mails sollen als Nachweis bleiben, 
 
 **Upstream-PR-Kandidat:** eher nein — der deutsche Vermerk ist Scher-spezifisch; die Mechanik wäre generisch.
 
+### 16. `attachments_url` — der Server lädt den Anhang selbst
+
+Hinzugefügt — **NEU** (v0.1.13). Anlass (2026-09-27): `send-offer-to-scher` hängte die Angebots-PDF
+(rund 137 KB, also 183 KB Base64) per `attachments_inline` an. Das Modell muss dafür jedes Base64-Zeichen
+wörtlich in den Aufruf schreiben, und im Test gelang das nicht verlässlich. Die PDF liegt im privaten
+Supabase-Bucket; `create_download_url` (scher-db) liefert eine signierte, 600 s gültige HTTPS-URL.
+
+- `send_email` (`app.py`) und `save_draft` (`scher_tools.py`) bekommen
+  `attachments_url: [{filename, url, content_type?}]`, an derselben Stelle wie `attachments_inline`
+  (gleiches TemporaryDirectory, danach entfernt), kombinierbar mit `attachments` und `attachments_inline`.
+  Die Zählung im Ergebnis („with N attachment(s)“) zählt alle drei Arten.
+- **Freischaltung per ENV** `MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS`: kommagetrennte Hostnamen, exakt
+  verglichen (Groß-/Kleinschreibung egal), keine Wildcards. Einträge, die kein reiner Hostname sind
+  (`*.x`, `https://…`, `host:443`), werden ignoriert und in `diag` als `ignored_entries` gemeldet.
+  Leer oder nicht gesetzt → Feature aus, jeder Aufruf mit `attachments_url` scheitert vor dem Versand.
+  Die Variable wird bei jedem Aufruf gelesen; in metamcp greift eine Änderung trotzdem erst nach
+  Neustart des Server-Prozesses.
+- **SSRF-Schutz:** nur `https`, nur Port 443 (oder ohne Port), keine Zugangsdaten in der URL, Host
+  exakt in der Liste. Die URL wird einmal mit `httpx.URL` geparst und genau dieses Objekt angefragt
+  (kein Parser-Unterschied zwischen Prüfung und Abruf). `follow_redirects=False`: jede 3xx-Antwort ist
+  ein Fehler, ebenso jeder Status außer 200 und eine leere Antwort. 30 s je Datei für den ganzen
+  Download (`asyncio.wait_for` über httpx' eigene 30-s-Timeouts), höchstens 25 MiB für alle
+  URL-Anhänge eines Aufrufs zusammen, beim Streamen gezählt (Content-Length wird vorab geprüft,
+  gezählt werden die dekodierten Bytes, also auch bei gzip).
+- **Erst alles laden, dann senden:** alle Einträge werden vor dem ersten Abruf geprüft, alle Dateien
+  liegen auf der Platte, bevor `handler.send_email` / `handler.save_draft` läuft. Ein Fehler bricht ab,
+  nichts wird gesendet oder gespeichert, das tmpdir wird entfernt.
+- **Token-Schutz:** Fehlermeldungen und Logzeilen nennen höchstens Host und Pfad, nie die Query.
+  Fremde Exception-Texte werden von URL, Query und Query-Werten bereinigt und ohne Exception-Kette
+  weitergereicht (`from None`). httpx loggt jede Anfrage samt voller URL auf INFO, und FastMCP stellt
+  den Root-Logger auf INFO — deshalb setzt `scher_tools` die Logger `httpx` und `httpcore` auf WARNING.
+- **Dateiname:** nur der Basisname (`/` und `\` als Trenner), Steuer-, Format- und Zeilentrennzeichen
+  entfernt (auch U+202E), leer, `.` oder `..` → Fehler, höchstens 200 Bytes. Jede Datei liegt in einem
+  eigenen Unterordner des tmpdir, gleiche Namen (auch neben `attachments_inline`) überschreiben sich nicht.
+- **MIME-Typ:** `content_type` des Aufrufers (muss `typ/subtyp` sein), sonst der der Antwort
+  (`application/octet-stream` zählt nicht), sonst aus der Endung, sonst `application/octet-stream`.
+  Er reist als `TypedAttachmentPath` (Unterklasse von `str` mit Attribut `content_type`) durch die
+  unveränderte Handler-Signatur; `EmailClient._create_attachment_part` nimmt ihn als optionales Argument.
+  Ohne ihn baut es den Teil exakt wie Upstream.
+- `diag` meldet einen Check `attachments_url` mit `enabled`, `allowed_hosts` (und ggf. `ignored_entries`);
+  die Variable steht zusätzlich im `env_overview`.
+- HTTP-Bibliothek: `httpx`, schon über `mcp` im Lockfile, jetzt direkt in `pyproject.toml` deklariert
+  (sonst meldet deptry DEP003). Kein neues Paket.
+
+**Upstream-PR-Kandidat:** ja — Anhänge per URL mit Host-Allowlist sind generisch nützlich.
+
 ## Berührungspunkte mit Upstream-Code
 
 Stand nach Implementierung der Patches (wird laufend aktualisiert):
@@ -310,17 +356,18 @@ Stand nach Implementierung der Patches (wird laufend aktualisiert):
 | Datei                                 | Änderung                                                                                                                                                                                   | Grund             |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- |
 | `mcp_email_server/emails/__init__.py` | abstract `mark_seen`, `mark_unseen`, `ensure_folder`; `send_email`-Signatur um `message_id` und `inline_images` erweitert; `save_draft` (nicht abstrakt, `NotImplementedError`)                                                                                      | Handler-Interface |
-| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`, `build_message` (aus `send_email` extrahiert), `append_to_drafts`, `_parse_list_line` (auch in `list_mailboxes`); `ClassicEmailHandler.save_draft`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `_create_related_part` + `inline_images` durch `build_message`/`send_email`/`save_draft`; `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
+| `mcp_email_server/emails/classic.py`  | `EmailClient.mark_seen`, `mark_unseen`, `ensure_folder`, `build_message` (aus `send_email` extrahiert), `append_to_drafts`, `_parse_list_line` (auch in `list_mailboxes`); `ClassicEmailHandler.save_draft`; `send_email` um `message_id` + `MCP_EMAIL_SERVER_REDIRECT_TO`-Logik erweitert; `_create_related_part` + `inline_images` durch `build_message`/`send_email`/`save_draft`; `_create_attachment_part` nimmt optional `content_type` (aus `TypedAttachmentPath`, `attachments_url`); `ClassicEmailHandler` delegiert die neuen Methoden; `_parse_email_data` und `_parse_headers` lesen `In-Reply-To` und `References`; `get_emails_content` propagiert sie | Implementation    |
 | `mcp_email_server/emails/models.py`   | `EmailMetadata` (und damit transitiv `EmailBodyResponse`) bekommen optionale Felder `in_reply_to`, `references`; `from_email`-Classmethod propagiert sie                                  | Data shape        |
-| `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` + `attachments_inline` (base64) + `inline_images` erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                  | Tool-Surface      |
-| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `materialize_inline_attachments()` + `decode_inline_images()` + `register_scher_tools()`-Funktion | Scher Extensions  |
+| `mcp_email_server/app.py`             | `send_email`-Tool-Signatur um `message_id` + `attachments_inline` (base64) + `attachments_url` + `inline_images` erweitert; eine Zeile `register_scher_tools(mcp)` am Modulende                                                  | Tool-Surface      |
+| `mcp_email_server/scher_tools.py`     | **neue Datei** mit `mark_seen`, `mark_unseen`, `ensure_folder`, `diag`, `get_attachment_as_images`-Tool-Wrappern + Renderer-Helfern + `materialize_inline_attachments()` + `materialize_url_attachments()`/`TypedAttachmentPath` + `decode_inline_images()` + `register_scher_tools()`-Funktion | Scher Extensions  |
 | `tests/test_scher_tools.py`           | **neue Datei** mit Mock-Tests für alle neuen Tools                                                                                                                                         | Testabdeckung     |
 | `tests/test_attachment_images.py`     | **neue Datei** mit Tests für `_render_attachment_to_images` + `_attachment_images_impl` (PDF/Bild/unsupported, Gate)                                                                       | Testabdeckung     |
 | `tests/test_inline_images.py`         | **neue Datei** mit Tests für `inline_images` (MIME-Aufbau, Validierung, Tool-Durchreichung, Entwurf)                                                                                       | Testabdeckung     |
+| `tests/test_attachments_url.py`       | **neue Datei** mit Tests für `attachments_url` (Allowlist, https, Port, Redirect, Status, Größe, Timeout, Token nie in Meldung/Log, kein Versand bei Fehler, `save_draft`, `diag`) | Testabdeckung     |
 | `tests/test_send_email_extensions.py` | **neue Datei** mit Tests für `message_id` und `REDIRECT_TO`                                                                                                                                | Regression-Schutz |
 | `tests/test_email_client.py`          | Tests für `In-Reply-To`/`References`-Parsing in beiden Parse-Pfaden (`_parse_email_data`, `_parse_headers`)                                                                              | Regression-Schutz |
 | `tests/test_models.py`                | Tests für `EmailMetadata.from_email` mit/ohne Reply-Header                                                                                                                              | Regression-Schutz |
-| `pyproject.toml`                      | `name` → `mcp-email-server-scher`, Entry-Point angepasst, hatchling wheel-package explizit; Dependencies `pillow` + `pymupdf` für `get_attachment_as_images`                              | Distribution      |
+| `pyproject.toml`                      | `name` → `mcp-email-server-scher`, Entry-Point angepasst, hatchling wheel-package explizit; Dependencies `pillow` + `pymupdf` für `get_attachment_as_images`, `httpx` (direkt deklariert) für `attachments_url`                              | Distribution      |
 | `README.md`                           | Neue Sektion "Scher Extensions"                                                                                                                                                            | Doku              |
 
 ## Upstream-Sync-Strategie

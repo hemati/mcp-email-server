@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
@@ -157,6 +157,21 @@ async def send_email(
             ),
         ),
     ] = None,
+    attachments_url: Annotated[
+        list[dict[str, Any]] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments the server downloads itself, so the caller passes a link instead of the file's "
+                'bytes (e.g. a signed storage download URL). Each item: {"filename": str, "url": str, '
+                "\"content_type\": str (optional; else the server's type, else the extension's)}. Only https on "
+                "port 443 to a host listed in the server's MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS (unset: feature "
+                "off); redirects are refused, 30 s per file, 25 MiB for all URL attachments together. Every file "
+                "is fetched before sending; if one fails, nothing is sent. Can be combined with `attachments` "
+                "and `attachments_inline`."
+            ),
+        ),
+    ] = None,
     inline_images: Annotated[
         list[dict[str, str]] | None,
         Field(
@@ -196,15 +211,23 @@ async def send_email(
     import contextlib
     import tempfile
 
-    from mcp_email_server.scher_tools import decode_inline_images, materialize_inline_attachments
+    from mcp_email_server.scher_tools import (
+        decode_inline_images,
+        materialize_inline_attachments,
+        materialize_url_attachments,
+    )
 
     handler = dispatch_handler(account_name)
     images = decode_inline_images(inline_images) if inline_images else None
     with contextlib.ExitStack() as stack:
         all_attachments = list(attachments or [])
-        if attachments_inline:
+        if attachments_inline or attachments_url:
             tmpdir = stack.enter_context(tempfile.TemporaryDirectory(prefix="scher_inline_"))
+        if attachments_inline:
             all_attachments += materialize_inline_attachments(attachments_inline, tmpdir)
+        if attachments_url:
+            # all files are downloaded before the send; one failure raises and nothing goes out
+            all_attachments += await materialize_url_attachments(attachments_url, tmpdir)
         await handler.send_email(
             recipients,
             subject,
@@ -220,7 +243,7 @@ async def send_email(
             **({"inline_images": images} if images else {}),
         )
     recipient_str = ", ".join(recipients)
-    total_attachments = len(attachments or []) + len(attachments_inline or [])
+    total_attachments = len(all_attachments)
     attachment_info = f" with {total_attachments} attachment(s)" if total_attachments else ""
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 

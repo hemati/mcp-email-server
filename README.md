@@ -315,8 +315,8 @@ the upstream server. The full upstream tool surface (`list_emails_metadata`,
 
 ### `send_email` extensions
 
-The upstream `send_email` tool gains two optional behaviors. Both default to
-the original behavior, so existing callers are unaffected.
+The upstream `send_email` tool gains optional behaviors. All default to the
+original behavior, so existing callers are unaffected.
 
 - **`message_id` argument** — override the auto-generated Message-Id header.
   Angle brackets (`<...>`) are added if missing. Useful when threading replies
@@ -333,6 +333,31 @@ the original behavior, so existing callers are unaffected.
   Set the env var on the **MCP server** process (e.g. via `mcpServers.env`
   in your MCP client config). Skills and other tool callers don't need to
   change anything.
+
+- **`attachments_url` argument** (also on `save_draft`, since v0.1.13) — the
+  server downloads the attachment itself, so a remote caller passes a link
+  instead of writing the file's bytes into the call as base64. Each item:
+
+  ```json
+  { "filename": "26025.pdf", "url": "https://<ref>.supabase.co/storage/v1/object/sign/…?token=…", "content_type": "application/pdf" }
+  ```
+
+  `content_type` is optional (otherwise the type the server answers with,
+  otherwise the one of the file extension). `filename` is reduced to its base
+  name without path separators or control characters; an empty name is an
+  error. Combinable with `attachments` and `attachments_inline`.
+
+  Off unless **`MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS`** names the hosts the
+  server may fetch from: comma-separated host names, exact match (case does
+  not matter), no wildcards, e.g. `abc123.supabase.co`. Unset or empty → every
+  call with `attachments_url` fails before anything is sent. Rules: `https`
+  only, port 443 only, no user info in the URL, redirects are refused (not
+  followed), only HTTP 200 with a non-empty body counts, 30 s per file,
+  25 MiB for all URL attachments of one call together (checked while
+  streaming). All files are downloaded before the mail is sent or the draft
+  stored; if one fails, nothing goes out. The URL's query (e.g. a signed
+  token) never appears in an error message or log line — at most host and
+  path. `diag` shows whether the feature is on and which hosts are allowed.
 
 ### Example client config
 
@@ -368,6 +393,13 @@ block:
 
 ```json
 "MCP_EMAIL_SERVER_REDIRECT_TO": "your-sink-address@example.com"
+```
+
+To let `send_email` / `save_draft` fetch attachments by URL, name the allowed
+hosts:
+
+```json
+"MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS": "abc123.supabase.co"
 ```
 
 ### Upstream sync

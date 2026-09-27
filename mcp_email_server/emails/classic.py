@@ -7,8 +7,10 @@ import ssl
 import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from email import encoders
 from email.header import Header
 from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -866,16 +868,26 @@ class EmailClient:
 
         return path
 
-    def _create_attachment_part(self, path: Path) -> MIMEApplication:
-        """Create MIME attachment part from file."""
+    def _create_attachment_part(self, path: Path, content_type: str | None = None) -> MIMEBase:
+        """Create MIME attachment part from file.
+
+        ``content_type`` (Scher v0.1.13, ``attachments_url``) replaces the type guessed from the
+        file extension; without it the part is built exactly as upstream builds it.
+        """
         with open(path, "rb") as f:
             file_data = f.read()
 
-        mime_type, _ = mimetypes.guess_type(str(path))
+        mime_type = content_type or mimetypes.guess_type(str(path))[0]
         if mime_type is None:
             mime_type = "application/octet-stream"
 
-        attachment_part = MIMEApplication(file_data, _subtype=mime_type.split("/")[1])
+        maintype, subtype = mime_type.split("/", 1)
+        if content_type and maintype != "application":
+            attachment_part = MIMEBase(maintype, subtype)
+            attachment_part.set_payload(file_data)
+            encoders.encode_base64(attachment_part)
+        else:
+            attachment_part = MIMEApplication(file_data, _subtype=subtype)
         attachment_part.add_header(
             "Content-Disposition",
             "attachment",
@@ -920,7 +932,8 @@ class EmailClient:
         for file_path in attachments:
             try:
                 path = self._validate_attachment(file_path)
-                attachment_part = self._create_attachment_part(path)
+                # A path from attachments_url carries its MIME type (scher_tools.TypedAttachmentPath).
+                attachment_part = self._create_attachment_part(path, getattr(file_path, "content_type", None))
                 msg.attach(attachment_part)
             except Exception as e:
                 logger.error(f"Failed to attach file {file_path}: {e}")

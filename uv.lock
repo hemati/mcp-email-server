@@ -1060,12 +1060,13 @@ cli = [
 
 [[package]]
 name = "mcp-email-server-scher"
-version = "0.1.12"
+version = "0.1.13"
 source = { editable = "." }
 dependencies = [
     { name = "aioimaplib" },
     { name = "aiosmtplib" },
     { name = "gradio" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "loguru" },
     { name = "mcp", extra = ["cli"] },
@@ -1096,6 +1097,7 @@ requires-dist = [
     { name = "aioimaplib", specifier = ">=2.0.1" },
     { name = "aiosmtplib", specifier = ">=4.0.0" },
     { name = "gradio", specifier = ">=6.0.1" },
+    { name = "httpx", specifier = ">=0.27.1" },
     { name = "jinja2", specifier = ">=3.1.5" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.23.0,<2" },

@@ -17,10 +17,13 @@ import contextlib
 import email
 import heapq
 import io
+import logging
+import mimetypes
 import os
 import re
 import socket
 import tempfile
+import unicodedata
 from datetime import date
 from email.generator import BytesGenerator
 from email.header import decode_header, make_header
@@ -29,7 +32,9 @@ from email.parser import BytesHeaderParser
 from email.policy import compat32
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import unquote_plus
 
+import httpx
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import Field
 
@@ -69,6 +74,7 @@ _REPORTED_ENV_VARS = (
     "MCP_EMAIL_SERVER_SENT_FOLDER_NAME",
     "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD",
     "MCP_EMAIL_SERVER_REDIRECT_TO",
+    "MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS",
     "MCP_EMAIL_SERVER_PASSWORD",
     "MCP_EMAIL_SERVER_IMAP_PASSWORD",
     "MCP_EMAIL_SERVER_SMTP_PASSWORD",
@@ -413,6 +419,239 @@ def materialize_inline_attachments(attachments_inline: list[dict], tmpdir: str) 
         Path(path).write_bytes(data)
         paths.append(path)
     return paths
+
+
+# --- URL attachments (the server downloads the file itself) ---
+# attachments_inline makes the caller write every base64 character of the file into the call; a
+# model copying 180 KB of base64 does not do that reliably. attachments_url passes a link instead,
+# e.g. a signed Supabase Storage URL, and the server fetches the file. Against SSRF only hosts named
+# in MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS are fetched, only https on port 443, no redirect is
+# followed, within a time and a size limit. Such a URL carries an access token in its query, so no
+# log line and no error message shows more of it than host and path.
+
+ATTACHMENT_URL_HOSTS_ENV_VAR = "MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS"
+_URL_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # all URL attachments of one call together
+_URL_ATTACHMENT_TIMEOUT_SECONDS = 30.0  # per file, for the whole download
+_URL_ATTACHMENT_KEYS = frozenset({"filename", "url", "content_type"})
+_URL_ATTACHMENT_TRANSPORT: httpx.AsyncBaseTransport | None = None  # tests put an httpx.MockTransport here
+_MAX_FILENAME_BYTES = 200
+_HOSTNAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
+_MIME_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")
+
+# httpx logs every request line, full URL included, at INFO, and FastMCP configures the root logger
+# at INFO: the token of a signed URL would end up in the server log (docker logs metamcp).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class AttachmentUrlError(ValueError):
+    """A URL attachment was refused or could not be fetched. The message never holds the URL's query."""
+
+
+class TypedAttachmentPath(str):
+    """A server path that also names the MIME type the file is sent with (read by ``EmailClient``)."""
+
+    content_type: str
+
+    def __new__(cls, path: str, content_type: str) -> TypedAttachmentPath:
+        obj = super().__new__(cls, path)
+        obj.content_type = content_type
+        return obj
+
+
+def attachment_url_hosts() -> tuple[list[str], list[str]]:
+    """``(allowed, ignored)`` from ``MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS``, read on every call.
+
+    Comma-separated host names, compared exactly (case-insensitive). An entry that is not a plain
+    host name (a wildcard, a scheme, a port, a path) is ignored instead of guessed at.
+    """
+    allowed: list[str] = []
+    ignored: list[str] = []
+    for entry in os.environ.get(ATTACHMENT_URL_HOSTS_ENV_VAR, "").split(","):
+        host = entry.strip().lower()
+        if not host:
+            continue
+        target = allowed if _HOSTNAME_RE.fullmatch(host) else ignored
+        if host not in target:
+            target.append(host)
+    return allowed, ignored
+
+
+def _where(url: httpx.URL) -> str:
+    """Host and path of ``url`` for messages; never the query, which holds the token."""
+    return f"{url.raw_host.decode('ascii', 'replace')}{url.path}"
+
+
+def _scrub(text: str, url: httpx.URL) -> str:
+    """Remove the URL, its query and each query value from ``text`` (a foreign exception message)."""
+    query = url.query.decode("ascii", "replace")
+    secrets = {str(url), query}
+    for pair in query.split("&"):
+        value = pair.partition("=")[2]
+        secrets.update({value, unquote_plus(value)})
+    for secret in sorted((s for s in secrets if len(s) >= 4), key=len, reverse=True):
+        text = text.replace(secret, "…")
+    return text
+
+
+def _url_attachment_filename(value: Any, label: str) -> str:
+    """Base name only: no directory part (``/`` or ``\\``), no control, format or line-break characters."""
+    if not isinstance(value, str):
+        raise AttachmentUrlError(f"{label}: filename fehlt.")
+    name = "".join(
+        ch for ch in value if unicodedata.category(ch)[0] != "C" and unicodedata.category(ch) not in ("Zl", "Zp")
+    )
+    name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if name in ("", ".", ".."):
+        raise AttachmentUrlError(f"{label}: filename ist ohne Pfad und Steuerzeichen leer.")
+    if len(name.encode()) > _MAX_FILENAME_BYTES:
+        raise AttachmentUrlError(f"{label}: filename ist länger als {_MAX_FILENAME_BYTES} Bytes.")
+    return name
+
+
+def _mime_type(value: Any) -> str | None:
+    """``type/subtype`` in lower case without parameters, or None when ``value`` is not one."""
+    if not isinstance(value, str):
+        return None
+    mime = value.split(";", 1)[0].strip().lower()
+    return mime if _MIME_TYPE_RE.fullmatch(mime) else None
+
+
+def _allowed_url(raw_url: Any, label: str, allowed: list[str]) -> httpx.URL:
+    """``raw_url`` parsed, if it is https on port 443 to an allowed host; the request uses this very object."""
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise AttachmentUrlError(f"{label}: url fehlt.")
+    try:
+        url = httpx.URL(raw_url.strip())
+    except Exception:
+        raise AttachmentUrlError(f"{label}: url ist keine gültige URL.") from None
+    where = _where(url)
+    if url.scheme != "https":
+        raise AttachmentUrlError(f"{label}: nur https ist erlaubt, nicht {url.scheme or '(kein Schema)'!r} ({where}).")
+    if url.userinfo:
+        raise AttachmentUrlError(f"{label}: Zugangsdaten in der URL sind nicht erlaubt ({where}).")
+    if url.port not in (None, 443):
+        raise AttachmentUrlError(f"{label}: nur Port 443 ist erlaubt, nicht {url.port} ({where}).")
+    host = url.raw_host.decode("ascii", "replace").lower()
+    if host not in allowed:
+        raise AttachmentUrlError(
+            f"{label}: Host {host!r} ist nicht freigegeben; {ATTACHMENT_URL_HOSTS_ENV_VAR} erlaubt {', '.join(allowed)}."
+        )
+    return url
+
+
+def _parse_url_attachment(index: int, item: Any, allowed: list[str]) -> tuple[str, httpx.URL, str | None]:
+    """Check one ``{"filename", "url", "content_type"?}`` without touching the network."""
+    label = f"URL-Anhang {index}"
+    if not isinstance(item, dict):
+        raise AttachmentUrlError(f'{label}: erwartet ein Objekt {{"filename", "url", "content_type"?}}.')
+    unknown = sorted(set(item) - _URL_ATTACHMENT_KEYS)
+    if unknown:
+        raise AttachmentUrlError(f"{label}: unbekannte Felder {unknown}; erlaubt sind filename, url, content_type.")
+    filename = _url_attachment_filename(item.get("filename"), label)
+    label = f"URL-Anhang {filename!r}"
+    url = _allowed_url(item.get("url"), label, allowed)
+    content_type = None
+    if item.get("content_type") is not None:
+        content_type = _mime_type(item["content_type"])
+        if content_type is None:
+            raise AttachmentUrlError(f"{label}: content_type muss die Form typ/subtyp haben, z. B. application/pdf.")
+    return filename, url, content_type
+
+
+async def _read_into(response: httpx.Response, dest: Path, budget: int, label: str, where: str) -> int:
+    """Write the body of a 200 response to ``dest``, stopping as soon as it grows past ``budget`` bytes."""
+    status = response.status_code
+    if 300 <= status < 400:
+        raise AttachmentUrlError(
+            f"{label}: {where} leitet weiter (HTTP {status}); Weiterleitungen werden nicht verfolgt."
+        )
+    if status != 200:
+        raise AttachmentUrlError(f"{label}: {where} antwortet mit HTTP {status}.")
+    too_big = (
+        f"{label}: zu groß, alle URL-Anhänge eines Aufrufs zusammen dürfen höchstens "
+        f"{_URL_ATTACHMENT_MAX_BYTES} Bytes (25 MiB) haben."
+    )
+    declared = response.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > budget:
+        raise AttachmentUrlError(too_big)
+    size = 0
+    with dest.open("wb") as fh:
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > budget:
+                raise AttachmentUrlError(too_big)
+            fh.write(chunk)
+    if size == 0:
+        raise AttachmentUrlError(f"{label}: {where} liefert eine leere Datei.")
+    return size
+
+
+async def _fetch_url_attachment(
+    client: httpx.AsyncClient, url: httpx.URL, dest: Path, budget: int, label: str
+) -> tuple[int, str | None]:
+    """Download ``url`` into ``dest`` within the time limit; returns (bytes, MIME type the server named)."""
+    where = _where(url)
+
+    async def fetch() -> tuple[int, str | None]:
+        async with client.stream("GET", url) as response:
+            size = await _read_into(response, dest, budget, label, where)
+            return size, _mime_type(response.headers.get("content-type"))
+
+    try:
+        return await asyncio.wait_for(fetch(), timeout=_URL_ATTACHMENT_TIMEOUT_SECONDS)
+    except AttachmentUrlError:
+        raise
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        raise AttachmentUrlError(
+            f"{label}: {where} hat nicht innerhalb von {_URL_ATTACHMENT_TIMEOUT_SECONDS:g} s geliefert."
+        ) from None
+    except Exception as e:
+        detail = _scrub(f"{type(e).__name__}: {e}", url)
+        raise AttachmentUrlError(f"{label}: Download von {where} fehlgeschlagen ({detail}).") from None
+
+
+async def materialize_url_attachments(attachments_url: list[Any], tmpdir: str) -> list[str]:
+    """Download ``[{"filename", "url", "content_type"?}, ...]`` into ``tmpdir``; returns the file paths.
+
+    Every item is checked before the first request, and every file is on disk before this returns:
+    a failure raises :class:`AttachmentUrlError` before the caller sends or stores anything. Each
+    file gets its own subdirectory, so equal names (also next to attachments_inline in the same
+    ``tmpdir``) cannot overwrite each other. The caller owns ``tmpdir`` and its cleanup. Each path
+    carries its MIME type: ``content_type`` if given, else the server's, else the extension's.
+    """
+    allowed, _ = attachment_url_hosts()
+    if not allowed:
+        raise AttachmentUrlError(
+            f"attachments_url ist abgeschaltet: {ATTACHMENT_URL_HOSTS_ENV_VAR} nennt keinen erlaubten Host."
+        )
+    items = [_parse_url_attachment(index, item, allowed) for index, item in enumerate(attachments_url, 1)]
+    paths: list[str] = []
+    budget = _URL_ATTACHMENT_MAX_BYTES
+    async with httpx.AsyncClient(
+        transport=_URL_ATTACHMENT_TRANSPORT, follow_redirects=False, timeout=_URL_ATTACHMENT_TIMEOUT_SECONDS
+    ) as client:
+        for index, (filename, url, content_type) in enumerate(items, 1):
+            folder = Path(tmpdir) / f"url-{index}"
+            folder.mkdir()
+            dest = folder / filename
+            size, served = await _fetch_url_attachment(client, url, dest, budget, f"URL-Anhang {filename!r}")
+            budget -= size
+            if served == "application/octet-stream":  # says nothing; the extension may know better
+                served = None
+            mime = content_type or served or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            paths.append(TypedAttachmentPath(str(dest), mime))
+            logger.info(f"attachments_url: {filename} ({size} bytes, {mime}) from {_where(url)}")
+    return paths
+
+
+def _attachments_url_check() -> dict[str, Any]:
+    """diag entry: is attachments_url on, and which hosts may it fetch from (host names are no secret)."""
+    allowed, ignored = attachment_url_hosts()
+    fields: dict[str, Any] = {"enabled": bool(allowed), "allowed_hosts": allowed}
+    if ignored:
+        fields["ignored_entries"] = ignored
+    return _check("attachments_url", not ignored, **fields)
 
 
 # --- Inline images (logo in an HTML signature) ---
@@ -861,7 +1100,8 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
     @mcp.tool(
         description=(
             "Run a connectivity self-test for the given account: env snapshot "
-            "(passwords masked), DNS, TCP connect, IMAP login + SELECT INBOX, "
+            "(passwords masked), whether attachments_url is on and for which hosts, "
+            "DNS, TCP connect, IMAP login + SELECT INBOX, "
             "SMTP login. Returns a list of per-check results."
         )
     )
@@ -876,6 +1116,7 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
         # 0. Env overview — always safe to report (secrets masked).
         env = _env_overview()
         checks.append(_check("env_overview", True, env=env))
+        checks.append(_attachments_url_check())
 
         # 1. Account lookup. Stop early if not found, since downstream checks
         #    all need the account.
@@ -1002,7 +1243,7 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
         description=(
             "Save an email as a DRAFT in the account's Drafts folder instead of sending it — for a human to "
             "review and send from the mail client. Same message as send_email (threading, cc/bcc, html, "
-            "attachments from the server filesystem or inline base64), stored with \\Draft; nothing goes "
+            "attachments from the server filesystem, inline base64 or a URL), stored with \\Draft; nothing goes "
             "over SMTP. The Drafts folder is found by its \\Drafts flag (IONOS: 'Entwürfe'). The test-mode "
             "redirect does not apply: the draft keeps the real recipients."
         )
@@ -1021,6 +1262,18 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
         attachments_inline: Annotated[
             list[dict[str, str]] | None,
             Field(default=None, description='Inline attachments: [{"filename": str, "content_base64": str}].'),
+        ] = None,
+        attachments_url: Annotated[
+            list[dict[str, Any]] | None,
+            Field(
+                default=None,
+                description=(
+                    'Attachments the server downloads: [{"filename": str, "url": str, "content_type": str '
+                    "(optional)}]. Only https on port 443 to a host in the server's "
+                    "MCP_EMAIL_SERVER_ATTACHMENT_URL_HOSTS, no redirects, 30 s per file, 25 MiB together. "
+                    "If one download fails, no draft is stored."
+                ),
+            ),
         ] = None,
         inline_images: Annotated[
             list[dict[str, str]] | None,
@@ -1047,6 +1300,8 @@ def register_scher_tools(mcp: FastMCP) -> None:  # noqa: C901
             files = list(attachments or [])
             if attachments_inline:
                 files += materialize_inline_attachments(attachments_inline, tmpdir)
+            if attachments_url:
+                files += await materialize_url_attachments(attachments_url, tmpdir)
             got = await handler.save_draft(
                 recipients=recipients,
                 subject=subject,
